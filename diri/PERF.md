@@ -1,5 +1,72 @@
 # diri performance record
 
+## Sidebar rows re-render only when they change (2026-09-28)
+
+**Where the time went.** A live sample of the installed app showed the main
+thread about 20% busy with 51 sessions, about four of them working. Roughly
+45% of that was `Sidebar` render, layout, prepaint, and paint. The sidebar is
+cached in RootView, but every 125 ms activity-mark tick notified it, and each
+re-render rebuilt all 51 rows.
+
+**Why a row cache needed GPUI changes.** Upstream GPUI (zed `dc2a339`, #21165)
+re-renders every cached view nested inside a cached view that missed its
+cache. It records cache ranges as absolute frame indices, which go stale
+while an ancestor is reused wholesale.
+
+**What changed.**
+
+- GPUI is now vendored in `vendor/gpui`, with the patch described in
+  `vendor/gpui/DIRI_PATCHES.md`. Cached views record ranges relative to their
+  nearest cached ancestor, so non-dirty nested views are reused. Opacity is
+  part of the cache key.
+- Each session row is a cached view that renders from a props snapshot. The
+  activity tick notifies only the working rows.
+- A store publication re-renders only rows whose props changed.
+
+Store churn was never the driver. The app already drops byte-identical
+`session.updated` events without publishing, and resource samples arrive
+every 30 s.
+
+**How it was measured.** `sidebar_fleet_render_cost` mounts the real RootView
+under headless Metal with five projects and four working sessions. It stands
+in cached blank rasters for brand marks, which production draws as CoreGraphics
+images on the main thread. One step is one notify plus the frame it causes.
+The numbers are release-build medians of 1,000 steps. Before and after ran as
+alternating binaries three times each, with load average ~15–20 from other
+agents:
+
+| 51 sessions | Rows built, before → after | Step median, before → after |
+| --- | ---: | ---: |
+| Activity tick | 51 → 4 | 1.53–1.61 → 1.05–1.06 ms |
+| Store publication (nothing changed) | 51 → 0 | 1.53–1.56 → 0.99–1.01 ms |
+| Root-only frame (sidebar reused) | 0 → 0 | 0.39–0.40 → 0.41–0.42 ms |
+
+Subtracting the root-only frame, a tick's sidebar share falls from about
+1.15 ms to 0.65 ms. Per-row growth falls from about 20 µs to about 6 µs:
+single runs at 5/25/51/100 sessions measured a tick at 0.72/1.09/1.75/2.70 ms
+before and 0.74/0.93/1.14/1.33 ms after. What remains per row is computing and
+comparing props, the list wrapper, and replaying cached ranges.
+
+A root-only frame costs about 0.03 ms more (+8%). Each row adds a view and a
+wrapper node that a reused sidebar replays.
+
+**Visual checks.** Pixels are identical to `main`:
+
+- 20 headless sidebar fixtures, light and dark: typical, fleet, stress,
+  projects, hover, recency, filter, session menu, hover card, lineage.
+- The bench's final frame, after roughly 3,000 steps.
+
+`reused_sidebar_rows_paint_like_a_full_render` checks the reuse path. After 11
+ticks interleaved with no-op publications and root frames, it compares against
+a `window.refresh()` rebuild and requires zero differing pixels. It fails if a
+working mark stops advancing.
+
+**Not claimed:**
+
+- any installed-app CPU change;
+- GPU or present cost;
+- the horizontal strip. It is rendered inline by RootView and still rebuilds
+  every tab.
 ## Terminal feed path, 4.1–4.7× faster per core (2026-09-28)
 
 Every local session's Engine and every remote session's Helper parse all PTY
@@ -388,6 +455,12 @@ all sessions (~1 ms here). Per-record serialization caching was not added.
 Reproduce from `diri/`:
 
 ```sh
+cargo test --release -p diri-app --bin diri sidebar_fleet_render_cost -- --ignored --nocapture
+cargo test -p diri-app --bin diri reused_sidebar_rows_paint_like_a_full_render -- --ignored
+cargo test -p diri-app --bin diri gpui_view_cache
+```
+
+`DIRI_BENCH_SESSIONS` and `DIRI_BENCH_ITERATIONS` scale the bench.
 cargo test -p gpui_macos --lib instance_buffer_pool
 cargo test -p diri-usage --test scan_peak_memory
 cargo run --release -p diri-usage --example usage_scan_bench
