@@ -4167,6 +4167,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         listening_ports: None,
         foreground_agent: None,
         terminal_cwd: None,
+        foreground_ports: None,
     }
 }
 
@@ -5143,6 +5144,7 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            foreground_ports: None,
         }
     }
 
