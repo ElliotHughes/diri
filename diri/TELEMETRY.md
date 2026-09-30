@@ -99,7 +99,9 @@ on), `hook.apply_wait` (queue-to-Registry wait of a queued hook report, i.e.
 how stale its status was when it landed), `attach.seed, ssh.command`.
 
 `modes` fields are `{mouse: "off"|"1000"|"1002"|"1003"|"unknown", sgr,
-alt_screen, bracketed_paste, app_cursor}` from the Engine's own emulator. The
+alt_screen, bracketed_paste, app_cursor, keyboard, focus}` from the Engine's
+own emulator (`keyboard`: kitty keyboard enhancements pushed; `focus`: DEC 1004
+focus reporting). The
 local Holder is a byte pipe with no parser, so terminal-mode facts are
 recorded by the Engine, not the Holder.
 
@@ -270,13 +272,13 @@ hang that ends in Force Quit still leaves a record. Durations are lower bounds
 | `pane.attached` | info | `session, reconnect, attempts, connect_ms, since_mount_ms` | attach latency, reattach loops |
 | `pane.attach_failing` | error | `session, attempts, reason, since_mount_ms` | a session that cannot be attached (3 failures) |
 | `pane.first_grid` | debug; warn if not a snapshot | `session, ms, snapshot` | first frame missing or a diff before a seed |
-| `pane.first_paint` | debug | `session, ms, grid_ms, parked` | mount → the first frame that drew content, taken inside the terminal element's paint. A pane that is never drawn (the selection pane under a workspace workbench, a warm pane of another tab, a window the system stopped drawing) records none; before 2026-09-30 the blank watchdog recorded those as a ~10 s "first paint" |
+| `pane.first_paint` | debug | `session, ms, grid_ms, shown_ms, parked` | mount (or, for a pane nobody drew at mount, the first frame that showed it: `shown_ms` after mount) → the first frame that drew content, taken inside the terminal element's paint; `grid_ms` stays relative to mount. Once per mount of a resident per view. A pane that is never drawn (the selection pane under a workspace workbench, a warm pane of another tab, a window the system stopped drawing) records none; before 2026-09-30 the blank watchdog recorded those as a ~10 s "first paint" |
 | `pane.blank` | incident; warn if live with a blank grid | `session, agent, state, got_grid, content, frames, ms` | "session doesn't render": drawn at least once since mount, running, and no content painted 10 s after mount. `content=true` means the grid holds content that was never painted (a missed repaint: always an incident). A pane never drawn since mount is not reported |
 | `pane.detached` | warn | `session, live_ms, grids, reseeds` | "Terminal connection interrupted" toast |
 | `pane.drain_interrupted` | warn | `session` | input possibly lost on detach |
 | `pane.input_rejected` | warn (≤ 1 per 5 s per session) | `session, input` (`input`\|`mouse`\|`mouse_motion`\|`scroll`), `reason` (`passive_view`\|`disconnected`\|`overloaded`) | typing that goes nowhere; lost lease |
 | `pane.resize_storm` | warn (≤ 1/min) | `session, flips, cols, rows` | layouts fighting over the PTY size |
-| `pane.modes` | debug | `session, mouse, mouse_bits, alt_screen, bracketed_paste` | mouse tracking left on after an agent exits (`^[[<35;…M` in zsh) |
+| `pane.modes` | debug | `session, mouse, mouse_bits, alt_screen, bracketed_paste` | mouse tracking left on after an agent exits (`^[[<35;…M` in zsh). Once per session per change: every view attached to the session sees the same Modes chunk, and before 2026-09-30 each of them recorded it |
 | `pane.drop` | info | `session, files, outcome` (`paste`\|`upload`\|`refused`), `partial, remote` | Finder drops that did nothing |
 | `pane.drop_upload_failed` | error | `session` | remote drop copy failed |
 | `clipboard.copy` | info | `source` (`selection`\|`osc52`), `outcome` (`ok`\|`not_on_pasteboard`\|`empty_selection`\|`relayed`\|`stale`\|`app_inactive`\|`unknown_session`\|`no_listener`), `size`, `ms`/`age_ms`, `mouse_captured`, `session` | "copy doesn't work" (incl. agent-captured mouse) |
