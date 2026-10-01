@@ -1338,7 +1338,12 @@ impl ControlServer {
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
         if let Some(record) = registry.record(&id) {
-            crate::telemetry::record_session_spawn(&record, "fresh", spawn_started.elapsed());
+            crate::telemetry::record_session_spawn(
+                &record,
+                "fresh",
+                spawn_started.elapsed(),
+                registry.other_live_agent(&id),
+            );
         }
         if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
@@ -1837,7 +1842,12 @@ impl ControlServer {
         self.spawn_session_with_intent(spec, Some(record), tracked)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         if let Some(record) = registry.record(&id) {
-            crate::telemetry::record_session_spawn(&record, "fresh", spawn_started.elapsed());
+            crate::telemetry::record_session_spawn(
+                &record,
+                "fresh",
+                spawn_started.elapsed(),
+                registry.other_live_agent(&id),
+            );
         }
         self.ensure_published_project(&mut registry, &captured.cwd, Some(&host.id));
         if tracked {
@@ -3580,7 +3590,12 @@ impl ControlServer {
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
         if let Some(record) = registry.record(&id) {
-            crate::telemetry::record_session_spawn(&record, "history", spawn_started.elapsed());
+            crate::telemetry::record_session_spawn(
+                &record,
+                "history",
+                spawn_started.elapsed(),
+                registry.other_live_agent(&id),
+            );
         }
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
