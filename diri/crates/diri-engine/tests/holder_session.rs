@@ -335,6 +335,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        scheduled_run: None,
     }
 }
 

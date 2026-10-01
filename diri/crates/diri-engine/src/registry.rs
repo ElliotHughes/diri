@@ -2829,6 +2829,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        scheduled_run: None,
     }
 }
 
@@ -3058,6 +3059,7 @@ mod tests {
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 

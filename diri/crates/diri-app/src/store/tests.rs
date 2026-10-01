@@ -68,6 +68,7 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        scheduled_run: None,
     }
 }
 
@@ -3435,6 +3436,7 @@ fn a_new_terminal_starts_where_the_last_terminal_in_its_project_was() {
         terminal_cwd: Some(cwd.to_owned()),
         note_id: None,
         terminal_progress: None,
+        scheduled_run: None,
         ..session(value, project, 2.0)
     };
     let (mut store, mut effects) = hydrated(
@@ -3494,6 +3496,7 @@ fn only_terminals_carry_a_location_for_their_hover() {
         terminal_cwd: Some("/work/p/web".into()),
         note_id: None,
         terminal_progress: None,
+        scheduled_run: None,
         ..session("term", "p", 1.0)
     };
     assert_eq!(

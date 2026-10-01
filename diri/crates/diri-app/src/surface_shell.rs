@@ -368,6 +368,7 @@ pub struct UtilitySurfaces {
     /// Installed monospace families, read when the font picker opens.
     terminal_font_families: Vec<String>,
     skills: gpui::Entity<crate::skills_page::SkillsPage>,
+    schedules: gpui::Entity<crate::schedules_page::SchedulesPage>,
     accounts: AccountsState,
     phone_access: Option<crate::phone_access::PhoneAccess>,
     phone_loading: bool,
@@ -496,6 +497,7 @@ impl UtilitySurfaces {
             Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
             Some("agents") => SettingsTab::Agents,
             Some("skills") => SettingsTab::Skills,
+            Some("schedules") => SettingsTab::Schedules,
             Some("accounts") => SettingsTab::Accounts,
             Some("shortcuts") => SettingsTab::Shortcuts,
             Some("worktrees") => SettingsTab::Worktrees,
@@ -565,9 +567,20 @@ impl UtilitySurfaces {
                 .map(|session| PathBuf::from(&session.cwd));
             skills.update(cx, |skills, cx| skills.open(project, cx));
         }
+        let schedules = cx.new(|cx| {
+            crate::schedules_page::SchedulesPage::new(
+                Arc::clone(&store_runtime),
+                Arc::clone(&runtime),
+                cx,
+            )
+        });
+        if settings_tab == SettingsTab::Schedules {
+            schedules.update(cx, |schedules, cx| schedules.open(cx));
+        }
         Self {
             focus,
             skills,
+            schedules,
             accounts: AccountsState::default(),
             phone_access: None,
             phone_loading: false,
@@ -1707,6 +1720,10 @@ impl UtilitySurfaces {
         if tab == SettingsTab::Skills {
             self.refresh_skills(cx);
         }
+        if tab == SettingsTab::Schedules {
+            self.schedules
+                .update(cx, |schedules, cx| schedules.open(cx));
+        }
         if tab == SettingsTab::Accounts {
             self.refresh_accounts(cx);
         }
@@ -2030,6 +2047,14 @@ impl UtilitySurfaces {
             && self
                 .skills
                 .update(cx, |skills, cx| skills.handle_key(event, cx))
+        {
+            return;
+        }
+        if self.surface == Surface::Settings
+            && self.settings_tab == SettingsTab::Schedules
+            && self
+                .schedules
+                .update(cx, |schedules, cx| schedules.handle_key(event, cx))
         {
             return;
         }
@@ -2499,6 +2524,7 @@ impl UtilitySurfaces {
             SettingsTab::WhatsNew => self.whats_new_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Skills => self.skills.clone().into_any_element(),
+            SettingsTab::Schedules => self.schedules.clone().into_any_element(),
             SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
             SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
@@ -6646,6 +6672,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Skills => {
             "skills catalogue catalog instructions personal project plugins search SKILL.md"
         }
+        SettingsTab::Schedules => {
+            "schedules scheduled tasks cron timer daily weekdays every morning run later catch up missed sleep wake open at login keep awake"
+        }
         SettingsTab::Accounts => {
             "accounts profiles work personal login authentication codex claude default config home"
         }
@@ -7647,6 +7676,7 @@ mod tests {
             Ok("whats-new") => SettingsTab::WhatsNew,
             Ok("agents") => SettingsTab::Agents,
             Ok("skills") => SettingsTab::Skills,
+            Ok("schedules") => SettingsTab::Schedules,
             Ok("accounts") => SettingsTab::Accounts,
             Ok("terminal") => SettingsTab::Terminal,
             Ok("worktrees") => SettingsTab::Worktrees,
@@ -8645,6 +8675,14 @@ mod tests {
                         surfaces.worktrees.entries.clear();
                         surfaces.worktrees.error = Some("Couldn't connect to the engine. Refresh to retry.".into());
                     }
+                }
+                if tab == SettingsTab::Schedules {
+                    surfaces.schedules.update(cx, |schedules, _| {
+                        schedules.seed_preview(
+                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64,
+                            std::env::var("DIRI_VISUAL_SCHEDULE_DRAFT").is_ok_and(|value| !value.is_empty()),
+                        )
+                    });
                 }
                 if tab == SettingsTab::Skills {
                     surfaces.skills.update(cx, |skills, _| {
