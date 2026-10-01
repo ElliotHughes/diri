@@ -3529,6 +3529,7 @@ impl Sidebar {
             migrating,
             activity_state,
             activity_frame,
+            progress,
             marked,
             hovered,
             focused,
@@ -3635,7 +3636,12 @@ impl Sidebar {
                     }
                 }))
                 .children(indent_rails(row, colors))
-                .child(activity_mark(activity_state, activity_frame, colors))
+                .child(crate::progress_mark::leading_mark(
+                    activity_state,
+                    activity_frame,
+                    progress,
+                    colors,
+                ))
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -3836,7 +3842,12 @@ impl Sidebar {
             // Activity shares the project's icon column. Leaf rows reserve
             // no empty disclosure column; only parents get a trailing fold.
             // Hover keeps activity visible and swaps identity for the close action.
-            .child(activity_mark(activity_state, activity_frame, colors))
+            .child(crate::progress_mark::leading_mark(
+                activity_state,
+                activity_frame,
+                progress,
+                colors,
+            ))
             .child(
                 if let Some(range) = super::filter::label_match(&title, filter) {
                     div()
