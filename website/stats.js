@@ -41,13 +41,16 @@ export const compact = n => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1
 
 if (typeof document !== 'undefined') {
   starCount().then(stars => {
-    for (const el of document.querySelectorAll('.star-count')) { el.textContent = compact(stars); el.hidden = false; }
+    for (const el of document.querySelectorAll('.star-count')) { el.textContent = compact(stars); el.classList.add('loaded'); }
     for (const link of document.querySelectorAll('.github-link')) link.setAttribute('aria-label', `Diri on GitHub, ${stars} stars`);
   }).catch(() => {});
   const cadence = document.querySelector('#cadence');
-  if (cadence) commitsSince(30).then(count => {
-    if (count < 20) return;
-    cadence.querySelector('span:last-child').textContent = `${count} commits in the last 30 days`;
-    cadence.hidden = false;
-  }).catch(() => {});
+  // The pill always holds its space; it only fades in, so the headline never moves.
+  if (cadence) {
+    const label = cadence.querySelector('span:last-child');
+    commitsSince(30)
+      .then(count => { label.textContent = count >= 20 ? `${count} commits in the last 30 days` : 'See what shipped this week'; })
+      .catch(() => { label.textContent = 'See what shipped this week'; })
+      .finally(() => cadence.classList.add('loaded'));
+  }
 }

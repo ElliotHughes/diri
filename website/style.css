@@ -908,3 +908,10 @@ html { overflow-x: clip; }
 .cadence-dot { width: 7px; height: 7px; border-radius: 50%; background: #8fd3a3; box-shadow: 0 0 0 3px #8fd3a326; }
 @media (hover: hover) and (pointer: fine) { .cadence:hover { color: var(--rp-text); border-color: #ffffff2e; } }
 @media (max-width: 600px) { .cadence { font-size: 12px; margin-bottom: 16px; } }
+
+/* Live numbers reserve their space and fade in, so nothing moves when they arrive. */
+.cadence { opacity: 0; transition: opacity 260ms ease, border-color 140ms ease, color 140ms ease; }
+.cadence.loaded { opacity: 1; }
+.star-count { display: inline-block; min-width: 3ch; opacity: 0; transition: opacity 260ms ease; }
+.star-count.loaded { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .cadence, .star-count { transition: none; } }
