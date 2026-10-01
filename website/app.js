@@ -11,12 +11,9 @@ setInputMethod('pointer');
 document.addEventListener('pointerdown', () => setInputMethod('pointer'), true);
 document.addEventListener('keydown', () => setInputMethod('keyboard'), true);
 const icon = name => `<span class="icon" data-icon="${name}" aria-hidden="true"></span>`;
+// Icon images come from style.css ([data-icon] / [data-agent] rules); this only keeps them out of the accessibility tree.
 function paintIcons(root = document) {
-  $$('[data-icon], [data-agent]', root).forEach(el => {
-    const folder = el.dataset.agent ? 'brand' : 'icons';
-    el.style.setProperty('--icon', `url("assets/${folder}/${el.dataset.agent || el.dataset.icon}.svg")`);
-    el.setAttribute('aria-hidden', 'true');
-  });
+  $$('[data-icon], [data-agent]', root).forEach(el => el.setAttribute('aria-hidden', 'true'));
 }
 const chats = {
   release: { title: 'Ship the 0.9 release', agent: 'claude', name: 'Claude Code', view: 'swarm', prompt: 'Use diri to ship 0.9: split the work across agents and report back.' },
@@ -45,6 +42,7 @@ function selectChat(id) {
   const preview = agentPreviews[chat.view || chat.agent].render(chat, notesAnswer);
   $('.terminal-body').dataset.cli = chat.agent;
   $('#terminal-content').innerHTML = `<div class="terminal-scene">${preview.html}</div>`;
+  $('#terminal-content').classList.toggle('tail', Boolean(preview.tail));
   $('.terminal-composer').innerHTML = preview.composer;
   $('.terminal-footer').innerHTML = preview.footer;
   $('.changes-content').innerHTML = preview.changes;
@@ -184,7 +182,8 @@ const syncMasthead = () => masthead.classList.toggle('scrolled', scrollY > 8);
 addEventListener('scroll', syncMasthead, { passive: true });
 syncMasthead();
 
-// The swarm demo: plays once when the window scrolls into view, then rests on its final state.
+// The swarm demo: the first frame is already mid-run (three helpers working), so the window is never empty.
+// When the window scrolls into view the helpers finish one by one, then it rests on its final state.
 const swarmScene = (() => {
   const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const steps = ['prompt', 'plan', 'spawn', 'notes', 'done'];
@@ -205,48 +204,37 @@ const swarmScene = (() => {
     const row = $$('[data-child-row]')[n - 1];
     if (row) setRow(row, status);
   };
-  const reveal = step => $(`[data-step="${step}"]`)?.classList.remove('scene-hidden');
-  const footer = text => { const f = $('.swarm-footer'); if (f) f.textContent = text; };
-  const composer = (text, typed) => {
-    const spans = $$('.terminal-composer span');
-    if (spans[1]) { spans[1].textContent = text; spans[1].classList.toggle('composer-typed', typed); }
+  const reveal = step => {
+    const line = $(`[data-step="${step}"]`);
+    if (!line?.classList.contains('scene-hidden')) return;
+    line.classList.remove('scene-hidden');
+    if (state === 'playing') line.classList.add('scene-in');
   };
+  const footer = text => { const f = $('.swarm-footer'); if (f) f.textContent = text; };
   function finish() {
     timers.forEach(clearTimeout); timers = [];
     state = 'done';
     $('.product').classList.remove('scene-running');
     steps.forEach(reveal);
-    $$('[data-child-row]').forEach(row => row.classList.remove('scene-hidden'));
     [1, 2, 3].forEach(n => setChild(n, 'done'));
     setRow($('.chat-row[data-chat="release"]'), 'done');
-    $('.changes-content')?.classList.remove('scene-hidden');
     footer('3 agents finished');
   }
   function prepare() {
-    steps.forEach(step => $(`[data-step="${step}"]`)?.classList.add('scene-hidden'));
-    $$('[data-child-row]').forEach(row => row.classList.add('scene-hidden'));
+    ['notes', 'done'].forEach(step => $(`[data-step="${step}"]`)?.classList.add('scene-hidden'));
     [1, 2, 3].forEach(n => setChild(n, 'run'));
     setRow($('.chat-row[data-chat="release"]'), 'run');
-    $('.changes-content')?.classList.add('scene-hidden');
-    composer('', true);
-    footer('Opus is ready');
+    footer('3 agents running');
   }
   function play() {
     state = 'playing';
     $('.product').classList.add('scene-running');
-    const prompt = chats.release.prompt;
-    const typeMs = 26;
-    [...prompt].forEach((_, i) => later(400 + i * typeMs, () => composer(prompt.slice(0, i + 1), true)));
-    let t = 400 + prompt.length * typeMs + 350;
-    later(t, () => { composer('', true); reveal('prompt'); footer('Thinking…'); });
-    later(t += 900, () => reveal('plan'));
-    later(t += 800, () => { reveal('spawn'); footer('3 agents running'); });
-    $$('[data-child-row]').forEach((row, i) => later(t + 150 + i * 220, () => row.classList.remove('scene-hidden')));
-    later(t += 2100, () => { setChild(1, 'done'); $('.changes-content')?.classList.remove('scene-hidden'); footer('2 agents running'); });
+    let t = 1400;
+    later(t, () => { setChild(1, 'done'); footer('2 agents running'); });
     later(t += 700, () => reveal('notes'));
     later(t += 1500, () => { setChild(2, 'done'); footer('1 agent running'); });
-    later(t += 1200, () => { setChild(3, 'done'); footer('3 agents finished'); });
-    later(t += 700, finish);
+    later(t += 1300, () => { setChild(3, 'done'); reveal('done'); footer('3 agents finished'); });
+    later(t += 400, finish);
   }
   let visible = false;
   const observer = new IntersectionObserver(entries => {
