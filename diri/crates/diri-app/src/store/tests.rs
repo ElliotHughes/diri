@@ -65,6 +65,7 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         listening_ports: None,
         foreground_agent: None,
         terminal_cwd: None,
+        note_id: None,
         foreground_ports: None,
         terminal_progress: None,
     }
@@ -3432,6 +3433,7 @@ fn a_new_terminal_starts_where_the_last_terminal_in_its_project_was() {
     let terminal = |value: &str, project: &str, cwd: &str| SessionRecord {
         kind: AgentKind::SHELL,
         terminal_cwd: Some(cwd.to_owned()),
+        note_id: None,
         terminal_progress: None,
         ..session(value, project, 2.0)
     };
@@ -3490,6 +3492,7 @@ fn only_terminals_carry_a_location_for_their_hover() {
     let mut terminal = SessionRecord {
         kind: AgentKind::SHELL,
         terminal_cwd: Some("/work/p/web".into()),
+        note_id: None,
         terminal_progress: None,
         ..session("term", "p", 1.0)
     };
@@ -3511,4 +3514,43 @@ fn only_terminals_carry_a_location_for_their_hover() {
         crate::switcher::terminal_location(&session("agent", "p", 1.0)),
         None
     );
+}
+
+#[test]
+fn a_reveal_request_selects_the_session() {
+    let agent = session("codex", "p", 1.0);
+    let note = session("note", "p", 2.0);
+    let (mut store, _effects) = hydrated(
+        vec![agent.clone(), note.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(agent.id.clone());
+    store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::SESSION_REVEAL.into(),
+        params: serde_json::json!({ "sessionID": note.id.0 }),
+        seq: 2,
+    });
+    assert_eq!(store.selected_session_id(), Some(&note.id));
+    // An unknown id is ignored rather than clearing the selection.
+    store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::SESSION_REVEAL.into(),
+        params: serde_json::json!({ "sessionID": "s_gone" }),
+        seq: 3,
+    });
+    assert_eq!(store.selected_session_id(), Some(&note.id));
+}
+
+#[test]
+fn opening_a_note_file_spawns_a_note_session_that_adopts_it() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.open_note_file(
+        "20261001-090000-abcd".into(),
+        crate::store::SpawnOptions::default(),
+    );
+    let Ok(StoreEffect::Spawn(params)) = effects.try_recv() else {
+        panic!("a note file opens through a spawn");
+    };
+    assert_eq!(params.kind, AgentKind::NOTE);
+    assert_eq!(params.note_id.as_deref(), Some("20261001-090000-abcd"));
 }

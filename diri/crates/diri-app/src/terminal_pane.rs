@@ -128,6 +128,8 @@ pub enum TerminalPaneEvent {
     ExternalDropFeedback {
         message: String,
     },
+    /// A note's mention chip asked to show another Session.
+    RevealSession(SessionId),
 }
 
 #[path = "session_links.rs"]
@@ -767,6 +769,13 @@ pub struct TerminalViewport {
 pub struct TerminalPane {
     #[cfg(test)]
     pub(crate) render_count: usize,
+    /// Hosts the note when this pane's session is a note Session: a note has
+    /// no PTY, so the pane shows the editor and never attaches.
+    note: Option<Entity<crate::notes::NotePane>>,
+    /// A block to put the caret on, for the next note shown or (when the
+    /// note id is set) only for that note: an adopted note file has no
+    /// Session yet, and the note still showing must not take its caret.
+    pending_note_block: Option<(Option<String>, usize)>,
     qol: QolState,
     /// The open Insert Path picker, bound to the session it was opened on.
     path_picker: Option<path_picker::PathPickerState>,
@@ -1046,6 +1055,8 @@ impl TerminalPane {
         let mut pane = Self {
             #[cfg(test)]
             render_count: 0,
+            note: None,
+            pending_note_block: None,
             window_store,
             runtime,
             _tokio_owner: tokio_owner,
@@ -1345,6 +1356,12 @@ impl TerminalPane {
     }
 
     pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.displayed_note().is_some() {
+            let pane = self.note_pane(window, cx);
+            pane.update(cx, |pane, _| pane.request_focus());
+            cx.notify();
+            return;
+        }
         if matches!(self.session_source, SessionSource::FollowSelection)
             && self.selected_id() != self.observed_selected_id
         {
@@ -2493,7 +2510,8 @@ impl TerminalPane {
         )
     }
 
-    fn selected_id(&self) -> Option<SessionId> {
+    /// The session this pane displays, note or not.
+    fn displayed_id(&self) -> Option<SessionId> {
         match &self.session_source {
             SessionSource::FollowSelection => self.window_store.as_ref().map_or_else(
                 || {
@@ -2508,6 +2526,73 @@ impl TerminalPane {
             ),
             SessionSource::Fixed(id) => Some(id.clone()),
         }
+    }
+
+    /// The displayed session when it is a note: (session, note file id).
+    fn displayed_note(&self) -> Option<(SessionId, String)> {
+        let id = self.displayed_id()?;
+        let store = self.runtime.store.read().expect("store");
+        let record = store.sessions().get(&id)?;
+        record
+            .is_note()
+            .then(|| (id.clone(), record.note_id.clone().unwrap_or_default()))
+    }
+
+    /// The terminal session this pane drives. A note has no terminal, so
+    /// every attach, input, and residency path sees nothing selected.
+    fn selected_id(&self) -> Option<SessionId> {
+        let id = self.displayed_id()?;
+        let note = self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .sessions()
+            .get(&id)
+            .is_some_and(|record| record.is_note());
+        (!note).then_some(id)
+    }
+
+    fn note_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::notes::NotePane> {
+        if let Some(pane) = &self.note {
+            return pane.clone();
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let pane = cx.new(|cx| crate::notes::NotePane::new(runtime, cx));
+        cx.subscribe_in(&pane, window, |_, _, event, window, cx| match event {
+            // Escape with nothing left to dismiss hands the keyboard to the
+            // sidebar, where ↑/↓ move between notes and sessions alike.
+            crate::notes::NotePaneEvent::Dismiss => {
+                window.dispatch_action(Box::new(crate::commands::FocusSidebar), cx);
+            }
+            crate::notes::NotePaneEvent::Reveal(id) => {
+                cx.emit(TerminalPaneEvent::RevealSession(id.clone()));
+            }
+        })
+        .detach();
+        self.note = Some(pane.clone());
+        pane
+    }
+
+    /// Put the caret on a note block (from the To-dos page) once the note
+    /// is shown.
+    pub(crate) fn reveal_note_block(&mut self, block: usize) {
+        self.pending_note_block = Some((None, block));
+    }
+
+    /// Put the caret on a block of note `note_id` once that note is shown.
+    pub(crate) fn reveal_block_in_note(&mut self, note_id: String, block: usize) {
+        self.pending_note_block = Some((Some(note_id), block));
+    }
+
+    /// Only the macOS window screenshots host a fixture note pane.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn set_note_pane_for_test(&mut self, pane: Entity<crate::notes::NotePane>) {
+        self.note = Some(pane);
     }
 
     fn open_account_continuation(&self, cx: &mut Context<Self>) {
@@ -3966,6 +4051,11 @@ impl TerminalPane {
                                 .child(glyph),
                         )
                     })
+                    .children(
+                        (header_width >= 420.0)
+                            .then(|| self.render_origin_note(session, colors))
+                            .flatten(),
+                    )
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -3996,6 +4086,52 @@ impl TerminalPane {
                     }),
             )
             .into_any_element()
+    }
+
+    /// A session started from a note shows that note before its title; a
+    /// click goes back to the note, scrolled to the to-do it works on.
+    fn render_origin_note(
+        &self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+    ) -> Option<AnyElement> {
+        let parent = session.parent.clone()?;
+        let title = {
+            let store = self.runtime.store.read().expect("store");
+            let note = store.sessions().get(&parent).filter(|p| p.is_note())?;
+            let title = note.title.trim();
+            if title.is_empty() {
+                "Untitled".to_owned()
+            } else {
+                title.to_owned()
+            }
+        };
+        let child = session.id.clone();
+        let runtime = Arc::clone(&self.runtime);
+        Some(
+            div()
+                .id("session-origin-note")
+                .flex_none()
+                .max_w(px(200.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(Typo::TITLE.size))
+                .text_color(colors.tertiary)
+                .cursor_pointer()
+                .hover(|el| el.text_color(colors.secondary))
+                .child(sf_symbol("doc.text", 12.0, colors.tertiary))
+                .child(div().min_w(px(0.0)).text_ellipsis().child(title))
+                .child(sf_symbol("chevron.right", 9.0, colors.tertiary))
+                .on_click(move |_, _, _| {
+                    runtime
+                        .store
+                        .write()
+                        .expect("store")
+                        .reveal_in_note(parent.clone(), child.clone());
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_inspector_toggle(
@@ -4764,6 +4900,31 @@ impl Render for TerminalPane {
         {
             self.render_count += 1;
         }
+        if let Some((session, note_id)) = self.displayed_note() {
+            let pane = self.note_pane(window, cx);
+            let reveal = match &self.pending_note_block {
+                Some((Some(wanted), _)) if *wanted != note_id => None,
+                _ => self.pending_note_block.take().map(|(_, block)| block),
+            };
+            pane.update(cx, |pane, cx| {
+                pane.show(&session, &note_id, window, cx);
+                if let Some(block) = reveal {
+                    pane.reveal_block(block, window, cx);
+                }
+            });
+            return div()
+                .id("terminal-note")
+                .track_focus(&self.focus)
+                .size_full()
+                .child(pane)
+                .into_any_element();
+        }
+        self.render_terminal(window, cx).into_any_element()
+    }
+}
+
+impl TerminalPane {
+    fn render_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_residency(cx);
         if window.is_window_active() && self.focus.is_focused(window) {
             self.claim_selected_control();

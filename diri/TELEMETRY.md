@@ -294,6 +294,31 @@ Sizes are buckets (`0`, `<64`, `<1k`, `<16k`, `<256k`, `<1m`, `>=1m`); no
 clipboard, paste, keystroke or terminal content is ever recorded.
 
 
+
+### Notes
+
+Counts only, through `telemetry::notes_event(name, kind)`: a fixed event name
+and, where it helps, a fixed family. Never note text, titles, URLs, session or
+note ids.
+
+| kind | sev | fields | catches |
+|---|---|---|---|
+| `notes.link_editor.opened` | info | | ⌘K panel use |
+| `notes.link.pasted` | info | `kind` (as `notes.link.set`) | bare links pasted, by tool family |
+| `notes.mention.inserted` | info | `kind` (`session`\|`note`) | `@` use |
+| `notes.fold.toggled` | info | `kind` (`chevron`\|`keyboard`) | folding by hand (not the to-do handoff's programmatic folds) |
+| `notes.link.set` | info | `kind` (`notion`\|`google`\|`linear`\|`hubspot`\|`figma`\|`slack`\|`github`\|`dashboard`\|`mention`\|`web`) | which tools people link, to decide which chips matter |
+| `notes.link.removed` | info | | links taken back out |
+| `notes.image.added` | info | `kind` (`paste`\|`drop`\|`picker`) | how pictures get into notes |
+| `notes.image.failed` | info | `kind` (as above) | pictures refused (format, size, write) |
+| `notes.callout.added` | info | | callout use |
+| `notes.table.inserted` | info | `kind` (`slash`) | tables made from `/table` |
+| `notes.table.pasted` | info | `kind` (`markdown`\|`tsv`\|`csv`) | tables pasted, and from where (Sheets/Excel/Numbers arrive as TSV) |
+| `notes.table.row_added` | info | | rows added (menu, ⌃⇧↑/↓, Tab in the last cell, Return in a cell) |
+| `notes.table.col_added` | info | | columns added (menu, ⌃⇧←/→, a wider paste) |
+| `notes.search.opened` | info | | Search notes page opened (⇧⌘F, ⌘K, To-dos header) |
+| `notes.search.result_opened` | info | `kind` (`live`\|`archived`\|`orphan`) | which notes people go back to, and whether archived and Session-less files matter |
+
 ## Upload
 
 The Engine's uploader wakes once a minute. If `spool/urgent` exists, or an

@@ -44,13 +44,13 @@ use crate::AppServices;
 use crate::commands::{
     self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
     DelegateSelectedSession, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
-    NewCodexSession, NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
-    QuoteSelection, QuoteSelectionToSession, RenameSelectedSession, ReopenSession,
-    SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
-    SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
-    SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
-    ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
-    ToggleSidebar, ToggleTabPeek,
+    NewCodexSession, NewDefaultSession, NewNote, NewTerminal, OpenLauncher, OpenSettings,
+    OpenWorktrees, QuoteSelection, QuoteSelectionToSession, RenameSelectedSession, ReopenSession,
+    SESSION_NAVIGATION_CONTEXT, SearchNotes, SelectLastSession, SelectNextAttentionSession,
+    SelectNextSession, SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3,
+    SelectSession4, SelectSession5, SelectSession6, SelectSession7, SelectSession8, ShowTodos,
+    ToggleAuxiliaryTerminal, ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview,
+    ToggleQuickOpen, ToggleSidebar, ToggleTabPeek,
 };
 use crate::external_drop::ExternalDropAction;
 use crate::haptics::{self, Haptic};
@@ -282,6 +282,10 @@ pub struct RootView {
     /// preference change re-applies it exactly once.
     applied_material: Option<WindowMaterial>,
     auxiliary_terminal: Option<Entity<TerminalPane>>,
+    /// The To-dos page covers the workbench while open; selecting any
+    /// session closes it.
+    todos_open: bool,
+    todos_page: Option<Entity<crate::notes::todos::TodosPage>>,
     auxiliary_id: Option<SessionId>,
     auxiliary_parent: Option<SessionId>,
     auxiliary_spawn_parent: Option<SessionId>,
@@ -454,6 +458,10 @@ impl RootView {
             sidebar.set_surface_in_parent();
             sidebar
         });
+        if !preview {
+            let todos = crate::notes::todos::TodosModel::global(&services.store, cx);
+            sidebar.update(cx, |sidebar, cx| sidebar.set_todos(todos, cx));
+        }
         let window_store = if preview {
             crate::store::WindowStore::from_canonical(services.store.store.clone())
         } else {
@@ -546,6 +554,9 @@ impl RootView {
                 TerminalPaneEvent::ExternalDropFeedback { message } => {
                     this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
+                TerminalPaneEvent::RevealSession(id) => {
+                    this.open_workspace_launch_session(id.clone(), window, cx);
+                }
             })
             .detach();
         }
@@ -566,6 +577,14 @@ impl RootView {
                     }
                 },
             ).detach();
+            cx.subscribe_in(
+                navigation,
+                window,
+                |this, _, opened: &crate::navigation::NoteOpened, window, cx| {
+                    this.show_opened_note(opened, window, cx);
+                },
+            )
+            .detach();
         }
         cx.observe(&sidebar, |_, sidebar, cx| {
             if sidebar.read(cx).project_picker_active() {
@@ -649,6 +668,12 @@ impl RootView {
                 cx.defer_in(window, move |_, window, cx| {
                     launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
                 });
+            }
+            if matches!(event, SidebarEvent::OpenTodos) {
+                this.open_todos(window, cx);
+            }
+            if matches!(event, SidebarEvent::SessionActivated) {
+                this.close_todos(cx);
             }
             if matches!(
                 event,
@@ -1360,6 +1385,8 @@ impl RootView {
             tabs_seam,
             tabs_target: tabs_seam,
             auxiliary_terminal: None,
+            todos_open: false,
+            todos_page: None,
             auxiliary_id: None,
             auxiliary_parent: None,
             auxiliary_spawn_parent: None,
@@ -1527,6 +1554,9 @@ impl RootView {
                                 cx,
                             )
                         }),
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::RevealSession(id),
+                        ) => this.open_workspace_launch_session(id.clone(), window, cx),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::Feedback { message },
                         ) => this.show_quote_feedback("Terminal", message.clone(), cx),
@@ -2095,6 +2125,7 @@ impl RootView {
         {
             let global_overlay_command = [
                 CommandId::ToggleHistory,
+                CommandId::SearchNotes,
                 CommandId::OpenSettings,
                 CommandId::ToggleCommandPalette,
                 CommandId::ToggleQuickOpen,
@@ -2204,6 +2235,13 @@ impl RootView {
                     });
                 }
             }
+            CommandId::SearchNotes => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| {
+                        navigation.toggle_search_notes(&SearchNotes, window, cx)
+                    });
+                }
+            }
             CommandId::ReviewLaunches => {
                 self.launches_expanded = true;
                 window.focus(&self.launches_focus, cx);
@@ -2213,6 +2251,25 @@ impl RootView {
             CommandId::ToggleOverview => {
                 if let Some(surfaces) = &self.session_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_overview(cx));
+                }
+            }
+            CommandId::ShowTodos => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
+                if self.todos_open {
+                    self.close_todos(cx);
+                    self.focus_active_terminal(window, cx);
+                } else {
+                    self.open_todos(window, cx);
+                }
+            }
+            CommandId::NewNote => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
+                if self.spawn_note() {
+                    self.focus_spawned_session(window, cx);
                 }
             }
             CommandId::OpenWorktrees => {
@@ -2416,6 +2473,81 @@ impl RootView {
             }),
         }
         true
+    }
+
+    /// ⌥⌘N: a note Session in the current project, created like ⌘T creates
+    /// a terminal. The Engine writes the note's file and the spawn reply
+    /// selects it.
+    fn spawn_note(&self) -> bool {
+        if self.preview {
+            return false;
+        }
+        self.window_store
+            .write()
+            .expect("session store lock poisoned")
+            .spawn_kind(AgentKind::NOTE, SpawnOptions::default());
+        true
+    }
+
+    fn open_todos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.todos_page.is_none() {
+            let runtime = Arc::clone(&self.services.store);
+            let model = crate::notes::todos::TodosModel::global(&runtime, cx);
+            let page = cx.new(|cx| crate::notes::todos::TodosPage::new(runtime, model, cx));
+            cx.subscribe_in(&page, window, |this, _, event, window, cx| {
+                use crate::notes::todos::TodosEvent;
+                let (session, block) = match event {
+                    TodosEvent::OpenNote { session, block } => (session.clone(), Some(*block)),
+                    TodosEvent::OpenSession(session) => (session.clone(), None),
+                };
+                this.close_todos(cx);
+                this.window_store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .select(session);
+                if let (Some(block), Some(terminal)) = (block, &this.terminal) {
+                    terminal.update(cx, |terminal, _| terminal.reveal_note_block(block));
+                }
+                this.focus_active_terminal(window, cx);
+                cx.notify();
+            })
+            .detach();
+            self.todos_page = Some(page);
+        }
+        self.todos_open = true;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_todos_active(true, cx));
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// A note the palette just opened (selected, unarchived or adopted):
+    /// leave the To-dos page, put the caret on the block that matched and
+    /// focus the editor.
+    fn show_opened_note(
+        &mut self,
+        opened: &crate::navigation::NoteOpened,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_todos(cx);
+        if let (Some(block), Some(terminal)) = (opened.block, &self.terminal) {
+            terminal.update(cx, |terminal, _| {
+                terminal.reveal_block_in_note(opened.note_id.clone(), block)
+            });
+        }
+        self.focus_active_terminal(window, cx);
+        cx.notify();
+    }
+
+    fn close_todos(&mut self, cx: &mut Context<Self>) {
+        if !self.todos_open {
+            return;
+        }
+        self.todos_open = false;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_todos_active(false, cx));
+        cx.notify();
     }
 
     fn focus_active_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3617,7 +3749,9 @@ impl RootView {
             .h(px(card_height))
             .min_h(px(0.0))
             .bg(terminal.work_surface_nested());
-        if self.active_workspace.is_some() {
+        if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
+            body = body.child(page);
+        } else if self.active_workspace.is_some() {
             let tab = {
                 let store = self.window_store.read().expect("store");
                 store
@@ -4910,6 +5044,15 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &OpenWorktrees, window, cx| {
                 this.run_command(CommandId::OpenWorktrees, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewNote, window, cx| {
+                this.run_command(CommandId::NewNote, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowTodos, window, cx| {
+                this.run_command(CommandId::ShowTodos, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchNotes, window, cx| {
+                this.run_command(CommandId::SearchNotes, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.run_command(CommandId::OpenSettings, window, cx);
@@ -9069,6 +9212,640 @@ mod tests {
                 .unwrap();
             cx.run_until_parked();
         }
+    }
+
+    /// A note Session selected in the real window: the sidebar lists it among
+    /// agents and terminals (one agent is its child), and the main area shows
+    /// the note editor. `DIRI_VISUAL_OUTPUT=<png>`, `DIRI_VISUAL_THEME=<id>`.
+    /// To-dos as agent work inside a note, in the real window: a
+    /// marketing launch plan whose to-dos are being worked on by agents.
+    /// `DIRI_VISUAL_OUTPUT=<png>`, `DIRI_VISUAL_THEME=<id>`,
+    /// `DIRI_WORK_SCENE=tracking|start|tick`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the note work-item screenshot artifact"]
+    fn render_note_work_screenshot() {
+        use diri_notes::edit::Pos;
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_VISUAL_OUTPUT").expect("DIRI_VISUAL_OUTPUT");
+        let scene = std::env::var("DIRI_WORK_SCENE").unwrap_or_else(|_| "tracking".into());
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+            cx.bind_keys(crate::notes::key_bindings());
+        });
+        let notes_dir = tempfile::tempdir().unwrap();
+        let note_store =
+            Arc::new(diri_notes::store::NoteStore::open(notes_dir.path().join("notes")).unwrap());
+        let (_, doc) = diri_notes::markdown::parse(crate::notes::work_item_tests::TRACKING);
+        let (note_id, _) = note_store.create(doc, None).unwrap();
+
+        let services = test_services();
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::from_env(None));
+        let template = fixture.list.sessions[0].clone();
+        let mut note = template.clone();
+        note.id = SessionId::new("s_note_launch");
+        note.kind = AgentKind::NOTE;
+        note.title = "Launch plan".into();
+        note.title_source = diri_proto::TitleSource::DirijorAssigned;
+        note.status = diri_proto::SessionStatus::Idle;
+        note.needs_input = None;
+        note.resumability = diri_proto::Resumability::NotResumable;
+        note.note_id = Some(note_id);
+        note.parent = None;
+        note.pinned = false;
+        note.archived_at = None;
+        note.git_branch = None;
+        note.foreground_agent = None;
+        note.pull_requests = None;
+        note.worktree_path = None;
+        let child = |id: &str, kind: AgentKind, title: &str| {
+            let mut s = template.clone();
+            s.id = SessionId::new(id);
+            s.kind = kind;
+            s.title = title.into();
+            s.parent = Some(note.id.clone());
+            s.archived_at = None;
+            s.pinned = false;
+            s.needs_input = None;
+            s.pull_requests = None;
+            s.foreground_agent = None;
+            s.last_turn_completed_at = None;
+            s
+        };
+        let mut posts = child("s_posts", AgentKind::CLAUDE_CODE, "Draft 3 LinkedIn posts");
+        posts.status = diri_proto::SessionStatus::Working;
+        let mut pricing = child("s_pricing", AgentKind::CODEX, "Pick the pricing headline");
+        pricing.status =
+            diri_proto::SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
+        pricing.needs_input = Some(diri_proto::NeedsInputDetail {
+            kind: diri_proto::NeedsInputKind::Question,
+            source: diri_proto::NeedsInputSource::CodexNotify,
+            tool_name: None,
+            summary: "Should the headline lead with price or with time saved?".into(),
+            prompt_excerpt: None,
+            options: None,
+            risk_hint: diri_proto::RiskHint::Neutral,
+            occurred_at: diri_proto::DateMillis(1.0),
+            secret: false,
+        });
+        let mut faq = child("s_faq", AgentKind::CLAUDE_CODE, "Write the launch FAQ");
+        faq.status = diri_proto::SessionStatus::Idle;
+        faq.last_turn_completed_at = Some(diri_proto::DateMillis(2.0));
+        let mut redirect = child(
+            "s_redirect",
+            AgentKind::CODEX,
+            "Fix the signup redirect loop",
+        );
+        redirect.status = diri_proto::SessionStatus::Idle;
+        redirect.last_turn_completed_at = Some(diri_proto::DateMillis(2.0));
+        redirect.pull_requests = Some(vec![
+            serde_json::from_value(serde_json::json!({
+                "url": "https://github.com/acme/app/pull/612", "number": 612,
+                "state": "OPEN", "isDraft": false, "additions": 18, "deletions": 4,
+                "changedFiles": 2, "commentCount": 0, "reviewCount": 0,
+                "checksPassed": 3, "checksFailed": 0, "checksPending": 0,
+                "fetchedAt": 0.0
+            }))
+            .unwrap(),
+        ]);
+        fixture.list.sessions.insert(1, note);
+        for session in [posts, pricing, faq, redirect] {
+            fixture.list.sessions.insert(2, session);
+        }
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.set_agent_catalog(crate::agent_setup::bundled_catalog(&[
+                "claude-code",
+                "codex",
+                "gemini",
+            ]));
+            store.select(SessionId::new("s_note_launch"));
+            store
+                .update_preferences(|prefs| {
+                    prefs.sidebar_visible = true;
+                    prefs.terminal_theme = std::env::var("DIRI_VISUAL_THEME")
+                        .unwrap_or_else(|_| "dirijor-light".into());
+                })
+                .unwrap();
+        }
+        let runtime = Arc::clone(&services.store);
+        let note_pane = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let window = cx
+            .open_window(size(px(1240.0), px(780.0)), {
+                let note_pane = note_pane.clone();
+                move |window, cx| {
+                    cx.new(|cx| {
+                        let root =
+                            RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                        let pane = cx.new(|cx| {
+                            crate::notes::NotePane::with_store(runtime, Some(note_store), false, cx)
+                        });
+                        *note_pane.borrow_mut() = Some(pane.clone());
+                        if let Some(terminal) = &root.terminal {
+                            terminal
+                                .update(cx, |terminal, _| terminal.set_note_pane_for_test(pane));
+                        }
+                        root
+                    })
+                }
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let pane = note_pane.borrow().clone().expect("note pane");
+        let editor = cx
+            .update(|cx| pane.read(cx).editor_for_test())
+            .expect("open note editor");
+        let find = |cx: &mut HeadlessAppContext, text: &'static str| {
+            cx.update(|cx| {
+                editor
+                    .read(cx)
+                    .editor
+                    .blocks()
+                    .iter()
+                    .position(|b| b.text.starts_with(text))
+                    .expect(text)
+            })
+        };
+        let posts = find(&mut cx, "Draft 3 LinkedIn");
+        let venue = find(&mut cx, "Book the venue");
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.push_work(cx)));
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |view, cx| {
+                // Show one started to-do open, with its context and report.
+                view.set_folded(posts, false, cx);
+                let end = view.editor.block(venue).text.len();
+                view.editor.set_caret(Pos::new(venue, end));
+                let focus = gpui::Focusable::focus_handle(view, cx);
+                window.focus(&focus, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        for _ in 0..2 {
+            cx.update_window(window.into(), |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+        }
+        match scene.as_str() {
+            "start" => {
+                let block = cx.update(|cx| editor.read(cx).editor.block(venue).id);
+                cx.update(|cx| {
+                    pane.update(cx, |pane, cx| {
+                        pane.on_work(&crate::notes::work_item::WorkRequest::Prepare { block }, cx)
+                    })
+                });
+            }
+            "tick" => {
+                cx.update(|cx| {
+                    editor.update(cx, |view, cx| {
+                        view.editor.set_caret(Pos::new(posts, 0));
+                        view.guard_tick(posts, cx);
+                    })
+                });
+            }
+            _ => {}
+        }
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.update_window(window.into(), |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(&output)
+            .unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the notes-in-window screenshot artifact"]
+    fn render_notes_in_window_screenshot() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_VISUAL_OUTPUT").expect("DIRI_VISUAL_OUTPUT");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+            cx.bind_keys(crate::notes::key_bindings());
+        });
+        let notes_dir = tempfile::tempdir().unwrap();
+        let note_store =
+            Arc::new(diri_notes::store::NoteStore::open(notes_dir.path().join("notes")).unwrap());
+        let (_, doc) = diri_notes::markdown::parse(crate::notes::tests::PLAN);
+        let (note_id, _) = note_store.create(doc, None).unwrap();
+        let history_note_id = note_id.clone();
+
+        let services = test_services();
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::from_env(None));
+        let template = fixture.list.sessions[0].clone();
+        let mut note = template.clone();
+        note.id = SessionId::new("s_note_plan");
+        note.kind = AgentKind::NOTE;
+        note.title = "Notes launch plan".into();
+        note.title_source = diri_proto::TitleSource::DirijorAssigned;
+        note.status = diri_proto::SessionStatus::Idle;
+        note.needs_input = None;
+        note.resumability = diri_proto::Resumability::NotResumable;
+        note.note_id = Some(note_id);
+        note.parent = None;
+        note.pinned = false;
+        note.archived_at = None;
+        note.agent_session_id = None;
+        note.transcript_path = None;
+        note.git_branch = None;
+        note.foreground_agent = None;
+        note.pull_requests = None;
+        note.listening_ports = None;
+        note.artifacts = None;
+        note.worktree_path = None;
+        note.created_at = template.created_at;
+        // One agent in the same project works for the note.
+        if let Some(child) =
+            fixture.list.sessions.iter_mut().find(|s| {
+                s.project_id == note.project_id && s.id != template.id && !s.is_archived()
+            })
+        {
+            child.parent = Some(note.id.clone());
+        }
+        let history_agent = fixture
+            .list
+            .sessions
+            .iter()
+            .find(|s| s.parent.as_ref() == Some(&note.id))
+            .map_or_else(|| template.id.0.clone(), |s| s.id.0.clone());
+        fixture.list.sessions.insert(1, note);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(SessionId::new("s_note_plan"));
+            store
+                .update_preferences(|prefs| {
+                    prefs.sidebar_visible = true;
+                    prefs.terminal_theme = std::env::var("DIRI_VISUAL_THEME")
+                        .unwrap_or_else(|_| "dirijor-light".into());
+                })
+                .unwrap();
+        }
+        let runtime = Arc::clone(&services.store);
+        cx.update(|cx| {
+            let model = cx.new(|cx| {
+                crate::notes::todos::TodosModel::with_store(
+                    Arc::clone(&runtime),
+                    Some(Arc::clone(&note_store)),
+                    false,
+                    cx,
+                )
+            });
+            crate::notes::todos::TodosModel::install(model, cx);
+        });
+        let note_pane = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let window = cx
+            .open_window(size(px(1240.0), px(780.0)), {
+                let note_pane = note_pane.clone();
+                move |window, cx| {
+                    cx.new(|cx| {
+                        let root =
+                            RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                        let pane = cx.new(|cx| {
+                            crate::notes::NotePane::with_store(runtime, Some(note_store), false, cx)
+                        });
+                        *note_pane.borrow_mut() = Some(pane.clone());
+                        if let Some(terminal) = &root.terminal {
+                            terminal
+                                .update(cx, |terminal, _| terminal.set_note_pane_for_test(pane));
+                        }
+                        root
+                    })
+                }
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // `DIRI_VISUAL_TODOS=1` opens the To-dos page from the sidebar row.
+        if std::env::var_os("DIRI_VISUAL_TODOS").is_some() {
+            cx.update_window(window.into(), |root, window, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                root.update(cx, |root, cx| root.open_todos(window, cx));
+            })
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_NOTE_MENU=slash|mention|chips|fold|links|link-editor|media|big|select|empty|table|table-wide|table-menu` types
+        // into the note:
+        // mention chips beside a to-do, then the `/` or `@` menu open at the
+        // caret, to judge the menus beside the rest of diri's chrome.
+        if let Ok(scene) = std::env::var("DIRI_VISUAL_NOTE_MENU") {
+            let pane = note_pane.borrow().clone().expect("note pane");
+            let editor = cx
+                .update(|cx| pane.read(cx).editor_for_test())
+                .expect("open note editor");
+            cx.update_window(window.into(), |_, window, cx| {
+                use diri_notes::edit::Pos;
+                use diri_notes::mention::MentionTarget;
+                use gpui::EntityInputHandler as _;
+                editor.update(cx, |view, cx| {
+                    view.set_mentions(
+                        crate::notes::editor_view::MentionDirectory {
+                            entries: crate::notes::tests::fixture_mentions(),
+                        },
+                        cx,
+                    );
+                    let row = view
+                        .editor
+                        .blocks()
+                        .iter()
+                        .position(|b| b.text.starts_with("Agents can"))
+                        .expect("fixture to-do");
+                    let end = view.editor.block(row).text.len();
+                    view.editor.set_caret(Pos::new(row, end));
+                    view.replace_text_in_range(None, " — waiting on ", window, cx);
+                    let at = view.editor.selection.head.offset;
+                    view.editor.insert_mention(
+                        at..at,
+                        &MentionTarget::Session("s_codex".into()),
+                        "@Codex: fix resize flicker",
+                        0,
+                    );
+                    view.replace_text_in_range(None, "and ", window, cx);
+                    let at = view.editor.selection.head.offset;
+                    view.editor.insert_mention(
+                        at..at,
+                        &MentionTarget::Note("n-q4".into()),
+                        "@Q4 campaign brief",
+                        0,
+                    );
+                    let quick = view
+                        .editor
+                        .blocks()
+                        .iter()
+                        .position(|b| b.text.starts_with("Quick capture"))
+                        .expect("fixture to-do");
+                    let end = view.editor.block(quick).text.len();
+                    view.editor.set_caret(Pos::new(quick, end));
+                    match scene.as_str() {
+                        "select" => {
+                            // A selection across blocks, over bold, a link
+                            // and chips.
+                            let intro = view
+                                .editor
+                                .blocks()
+                                .iter()
+                                .position(|b| b.text.starts_with("A rich"))
+                                .expect("intro");
+                            view.editor.set_selection(diri_notes::edit::Selection {
+                                anchor: Pos::new(intro, 2),
+                                head: Pos::new(row, 30),
+                            });
+                            window.focus(&view.focus_handle(cx), cx);
+                        }
+                        "empty" => {
+                            view.reload(
+                                diri_notes::edit::Editor::new(&diri_notes::doc::Document::new(
+                                    "",
+                                    Vec::new(),
+                                )),
+                                cx,
+                            );
+                            view.editor.set_caret(Pos::new(1, 0));
+                            window.focus(&view.focus_handle(cx), cx);
+                        }
+                        "table" | "table-wide" | "table-menu" => {
+                            // The user's screenshot: an agent's gap analysis,
+                            // once raw pipes, now a table.
+                            let source = match scene.as_str() {
+                                "table-wide" => crate::notes::tests::WIDE_TABLE,
+                                _ => crate::notes::tests::AGENT_GAPS,
+                            };
+                            let (_, doc) = diri_notes::markdown::parse(source);
+                            view.reload(diri_notes::edit::Editor::new(&doc), cx);
+                            let first = view
+                                .editor
+                                .blocks()
+                                .iter()
+                                .position(|b| b.kind.is_cell())
+                                .expect("a table");
+                            if scene == "table-menu" {
+                                // Editing: caret in a body cell, menu open.
+                                let cell = first + 3 * 2 + 1;
+                                let len = view.editor.block(cell).text.len();
+                                view.editor.set_caret(Pos::new(cell, len));
+                                window.focus(&view.focus_handle(cx), cx);
+                                view.open_table_menu(cx);
+                            } else {
+                                view.editor.set_caret(Pos::new(0, 0));
+                            }
+                        }
+                        "big" => {
+                            // A long note, scrolled deep: only nearby blocks
+                            // are laid out.
+                            let (_, doc) = diri_notes::markdown::parse(
+                                &crate::notes::tests::big_note_markdown(2000),
+                            );
+                            view.reload(diri_notes::edit::Editor::new(&doc), cx);
+                            view.editor.set_caret(Pos::new(0, 0));
+                        }
+                        "media" => {
+                            // A picture and every callout tone.
+                            let picture = notes_dir.path().join("funnel.png");
+                            std::fs::write(&picture, crate::notes::tests::chart_png(1200, 520))
+                                .expect("fixture picture");
+                            view.editor.enter(0);
+                            view.editor.turn_into(
+                                diri_notes::edit::Turn::Kind(diri_notes::doc::BlockKind::Paragraph),
+                                0,
+                            );
+                            view.insert_image_files(&[picture], "drop", cx);
+                            for (tone, text) in [
+                                (diri_notes::doc::Tone::Tip, "Paste a screenshot straight into a note."),
+                                (diri_notes::doc::Tone::Warning, "Q4 budget is capped at $5k."),
+                            ] {
+                                view.editor.insert_text(text, 0);
+                                view.editor.turn_into(
+                                    diri_notes::edit::Turn::Kind(diri_notes::doc::BlockKind::Callout(tone)),
+                                    0,
+                                );
+                                view.editor.enter(0);
+                            }
+                            let first = view
+                                .editor
+                                .blocks()
+                                .iter()
+                                .position(|b| b.kind == diri_notes::doc::BlockKind::Image)
+                                .expect("image");
+                            view.editor.set_caret(Pos::new(first, 0));
+                        }
+                        "link-editor" => {
+                            // ⌘K on "calm" with a Notion URL typed in.
+                            let intro = view
+                                .editor
+                                .blocks()
+                                .iter()
+                                .position(|b| b.text.starts_with("A rich"))
+                                .expect("intro");
+                            let calm = view.editor.block(intro).text.find("calm").unwrap_or(0);
+                            view.editor.set_selection(diri_notes::edit::Selection {
+                                anchor: Pos::new(intro, calm),
+                                head: Pos::new(intro, calm + 4),
+                            });
+                            view.link(&crate::notes::editor_view::Link, window, cx);
+                            view.replace_text_in_range(
+                                None,
+                                "notion.so/acme/Calm-writing-1f2e3d4c5b6a79881f2e3d4c5b6a7988",
+                                window,
+                                cx,
+                            );
+                        }
+                        "links" => {
+                            // A research line a PM would write: tool links
+                            // pasted bare become titled chips.
+                            view.editor.enter(0);
+                            view.editor.turn_into(diri_notes::edit::Turn::Kind(diri_notes::doc::BlockKind::Paragraph), 0);
+                            view.editor.insert_text("Sources: ", 0);
+                            for url in [
+                                "https://www.notion.so/acme/Q4-campaign-brief-1f2e3d4c5b6a79881f2e3d4c5b6a7988",
+                                "https://docs.google.com/spreadsheets/d/1AbC/edit",
+                                "https://linear.app/acme/issue/GRO-42/launch-email",
+                                "https://www.figma.com/design/AbC123/Onboarding-v2",
+                                "https://app.hubspot.com/contacts/1/record/0-3/2",
+                                "https://acme.slack.com/archives/C024BE91L/p1700000000000100",
+                                "https://app.amplitude.com/analytics/acme/chart/abc",
+                                "https://github.com/cristicretu/diri/pull/600",
+                            ] {
+                                view.editor.paste_url(url, 0);
+                                view.editor.insert_text(" ", 0);
+                            }
+                        }
+                        "fold" => {
+                            // Two nested items under "Quick capture", folded
+                            // under "Agents can append".
+                            view.editor.enter(0);
+                            view.editor.indent(false, 0);
+                            view.editor.insert_text("Global hotkey", 0);
+                            view.editor.enter(0);
+                            view.editor.insert_text("Capture panel", 0);
+                            let agents = view
+                                .editor
+                                .blocks()
+                                .iter()
+                                .position(|b| b.text.starts_with("Agents can"))
+                                .expect("fixture to-do");
+                            view.editor.set_caret(Pos::new(agents, 0));
+                            let end = view.editor.block(agents).text.len();
+                            view.editor.set_caret(Pos::new(agents, end));
+                            view.editor.enter(0);
+                            view.editor.indent(false, 0);
+                            view.editor.insert_text("Hidden while folded", 0);
+                            view.set_folded(agents, true, cx);
+                        }
+                        "slash" => {
+                            view.editor.enter(0);
+                            view.editor
+                                .backspace(diri_notes::edit::Granularity::Grapheme, 0);
+                            view.replace_text_in_range(None, "/", window, cx);
+                        }
+                        "mention" => {
+                            view.replace_text_in_range(None, " — ask ", window, cx);
+                            view.replace_text_in_range(None, "@", window, cx);
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_NOTE_HISTORY=1` opens Version History with earlier
+        // versions a person, an agent, and the person again wrote.
+        if std::env::var_os("DIRI_VISUAL_NOTE_HISTORY").is_some() {
+            use diri_notes::history::{Author, History, Reason, now_ms};
+            let pane = note_pane.borrow().clone().expect("note pane");
+            let history = History::new(&notes_dir.path().join("notes"));
+            let note_id = history_note_id.clone();
+            // Replace the creation version with a believable past.
+            let _ = std::fs::remove_dir_all(notes_dir.path().join("notes/.history").join(&note_id));
+            let base = crate::notes::tests::PLAN;
+            let now = now_ms();
+            let agent = Author::Session(history_agent.clone());
+            for (age_ms, author, text) in [
+                (
+                    3 * 86_400_000,
+                    Author::User,
+                    base.replace("\n## Open questions", "\n## Open questions\n\n> Draft"),
+                ),
+                (
+                    2 * 3_600_000,
+                    agent,
+                    format!("{base}\n- Finding: quick capture needs a global hotkey\n"),
+                ),
+                (
+                    20 * 60_000,
+                    Author::User,
+                    format!(
+                        "{base}\n- Finding: quick capture needs a global hotkey\n- [ ] Pick the hotkey\n"
+                    ),
+                ),
+            ] {
+                history
+                    .record(&note_id, &text, &author, Reason::Write, now - age_ms)
+                    .unwrap();
+            }
+            cx.update_window(window.into(), |_, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.open_versions(&crate::commands::NoteVersionHistory, window, cx);
+                    pane.select_version(1, cx);
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        if std::env::var("DIRI_VISUAL_NOTE_MENU").as_deref() == Ok("big") {
+            let pane = note_pane.borrow().clone().expect("note pane");
+            let editor = cx
+                .update(|cx| pane.read(cx).editor_for_test())
+                .expect("open note editor");
+            // Scroll like a trackpad: many steps, a frame each, so heights
+            // are measured as blocks come into view.
+            for _ in 0..150 {
+                cx.update_window(window.into(), |_, _, cx| {
+                    editor.update(cx, |view, cx| view.scroll_by_for_test(px(-120.0), cx));
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+                    .unwrap();
+            }
+        }
+        for _ in 0..3 {
+            cx.update_window(window.into(), |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(&output)
+            .unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
     }
 
     /// The first-run and resting pages inside the real window, so they are
