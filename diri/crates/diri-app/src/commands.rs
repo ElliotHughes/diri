@@ -416,7 +416,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some(APP_CONTEXT),
         "Session Overview",
         "square.grid.2x2",
-        "board grid switcher all sessions"
+        "board grid switcher all sessions pinch zoom"
     ),
     spec!(
         ToggleTabPeek,
@@ -426,7 +426,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some(APP_CONTEXT),
         "Peek Tabs",
         "rectangle.stack",
-        "preview overview gesture two finger pinch"
+        "preview strip tabs glance"
     ),
     spec!(
         ReviewLaunches,

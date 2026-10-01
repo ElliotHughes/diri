@@ -129,6 +129,29 @@ cursor from it, so a panel and the window under it would fight over the
 cursor (an arrow against an I-beam while a terminal streams beneath the
 palette).
 
+## 4. Scene region capture (`Window::capture_region`)
+
+Upstream can only read a rendered frame back in test builds
+(`render_to_image`, behind `test-support`), and only as a whole-window RGBA
+image. The overview zoom needs a bitmap of one pane, as the last frame drew
+it, in the release app, at the start of a pinch.
+
+`Window::capture_region(bounds, levels)` hands the last frame's scene to a new
+`PlatformWindow::capture_scene_region(scene, region, levels)` and wraps each
+returned level as a `RenderImage` ready for `paint_image`. The default
+implementation bails, so platforms without it fall back (the zoom
+cross-fades). `SceneCapture` is one BGRA level; `SceneCapture::from_rgba_frame`
+crops and box-filters a full frame on the CPU. `PlatformHeadlessRenderer`
+gains a defaulted `capture_scene_region` built on that, and `TestWindow`
+routes the call to its headless renderer, so headless tests exercise the
+real Metal path (`vendor/gpui_macos/README.diri.md`). The images belong to the
+caller, who must `drop_image` them when they stop being painted.
+
+Cost (headless Metal, 1200 x 662 pt pane at 2x, 4 levels, M-series, debug
+build on a loaded machine): about 3.5 to 6 ms per capture, about 15 ms for the
+first capture in a process. Capturing never presents or disturbs the next
+frame.
+
 ## Re-applying on a GPUI bump
 
 1. Replace `src/` (and `build.rs`, `README.md`, `resources/`) with the new
@@ -143,8 +166,10 @@ palette).
    `relative_to`/`rebased_on`, `CachedViewBase*`, base stacks, deferred-draw
    bases, `insert_debug_bounds`, `debug_bounds_history` replay, and the
    `exempt_from_inactive_throttle` frame-rate exemption),
-   `text_system/line_layout.rs` (`LineLayoutIndex` arithmetic) and
-   `elements/div.rs` (prepaint opacity, `insert_debug_bounds`).
+   `text_system/line_layout.rs` (`LineLayoutIndex` arithmetic),
+   `elements/div.rs` (prepaint opacity, `insert_debug_bounds`), and the scene
+   capture: `platform.rs` (`capture_scene_region`, `SceneCapture`),
+   `window.rs` (`capture_region`), `platform/test/window.rs`.
 4. If upstream added a new per-frame collection to `PrepaintStateIndex` or
    `PaintIndex`, extend `relative_to`/`rebased_on`, and confirm its reuse
    copies element for element.

@@ -1549,6 +1549,7 @@ dependencies = [
  "diri-proto",
  "diri-telemetry",
  "diri-term",
+ "diri-terminal-state",
  "diri-ui",
  "diri-updater",
  "diri-usage",
