@@ -882,6 +882,10 @@ pub struct TerminalPane {
     /// daemon-created id asynchronously, so this transition is also the
     /// reliable point at which keyboard focus can leave the picker.
     observed_selected_id: Option<SessionId>,
+    /// A saved workspace is painted in this pane's place. Selection still
+    /// moves as workspace panes take focus, but this pane must not follow it
+    /// with the keyboard: keys sent to an unrendered pane reach nothing.
+    covered: bool,
     #[cfg(test)]
     input_observer: Option<InputObserver>,
     /// Every `pane.blank` this pane recorded, for tests.
@@ -1130,6 +1134,7 @@ impl TerminalPane {
             pane_tx,
             next_attachment_generation: 1,
             focus,
+            covered: false,
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
             main_viewport: gpui::Size::default(),
@@ -1391,7 +1396,7 @@ impl TerminalPane {
         // successful spawns select their daemon-assigned id on the async store
         // path. Following the selection here covers both RPC/event orderings
         // and avoids trying to focus a terminal before its id exists.
-        if selection_changed && selected_id.is_some() {
+        if selection_changed && selected_id.is_some() && !self.covered {
             self.focus(window, cx);
         }
         self.reconcile_secure_input(window);
@@ -1683,6 +1688,10 @@ impl TerminalPane {
 
     pub fn header_hidden(&self) -> bool {
         self.header_hidden
+    }
+
+    pub(crate) fn set_covered(&mut self, covered: bool) {
+        self.covered = covered;
     }
 
     /// Height of the chrome painted above the terminal surface, which every
@@ -4571,7 +4580,16 @@ impl TerminalPane {
         if session.is_archived() {
             return self.render_archived_overlay(session, colors, cx);
         }
-        let exited = matches!(session.status, SessionStatus::Exited(_));
+        // A session on its way out (a clean `exit` closes it) keeps its last
+        // screen, bare, until the window moves on: an exit card or pill would
+        // flash for the frames its tab takes to switch.
+        let closing = !self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .is_open(&session.id);
+        let exited = matches!(session.status, SessionStatus::Exited(_)) && !closing;
         // An exited agent leaves its last screen behind in the daemon, and that
         // output is exactly what people want to read after closing an agent --
         // so only take the pane over when there is no terminal left to show.
@@ -4580,6 +4598,9 @@ impl TerminalPane {
         }
         self.probe_history_extent(&session.id);
         let Some(resident) = self.residents.get(&session.id) else {
+            if closing {
+                return div().size_full().into_any_element();
+            }
             return centered_message("Preparing terminal…", "", colors).into_any_element();
         };
         let element = resident
@@ -4742,7 +4763,9 @@ impl TerminalPane {
         }
         // An exited session's own pill already says it ended and offers Resume.
         let unavailable = attachment_state == AttachmentState::Unavailable && !exited;
-        if show_attaching || attachment_state == AttachmentState::Reconnecting || unavailable {
+        if !closing
+            && (show_attaching || attachment_state == AttachmentState::Reconnecting || unavailable)
+        {
             let message = match attachment_state {
                 AttachmentState::Reconnecting => "Reconnecting terminal…",
                 AttachmentState::Unavailable => "Terminal unavailable",
@@ -4819,6 +4842,7 @@ impl TerminalPane {
         let resumable = session.can_resume();
         let mut pill = div()
             .id("exit-pill")
+            .debug_selector(|| "exit-pill".into())
             .rounded(px(999.0))
             .pl(px(12.0))
             .pr(if resumable { px(4.0) } else { px(12.0) })
@@ -5115,7 +5139,8 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = session.id.clone();
-        let content = centered_message("", &exit_description(session), colors);
+        let content = centered_message("", &exit_description(session), colors)
+            .debug_selector(|| "exited-card".into());
         if session.can_resume() {
             let resume = primary_button(
                 "resume-conversation",

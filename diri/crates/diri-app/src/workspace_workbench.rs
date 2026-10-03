@@ -218,6 +218,10 @@ impl WorkspaceWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Read before `reconcile` drops a pane: a dropped terminal's handle
+        // can still be the window's focus, but it no longer reaches a key
+        // binding, so typing and ⌘T would wait for a click.
+        let held_focus = self.placeholder_focus.contains_focused(window, cx);
         self.enabled = true;
         let focus_changed = self.pending_focus.is_none()
             && self
@@ -276,12 +280,23 @@ impl WorkspaceWorkbench {
         self.reconcile(window, cx);
         self.flush_focus();
         self.assign_visible_owners(window, cx);
-        if switched || focus_changed {
+        if switched || focus_changed || (held_focus && self.keyboard_stranded(window, cx)) {
             self.focus(window, cx);
         }
         if changed {
             cx.notify();
         }
+    }
+
+    /// Keyboard focus was inside this workbench but no mounted pane holds it:
+    /// its pane was dropped with its session, or it waited on the placeholder
+    /// for the focused pane's session, which has now arrived.
+    fn keyboard_stranded(&self, window: &Window, cx: &gpui::App) -> bool {
+        !self
+            .mounted
+            .values()
+            .any(|pane| pane.terminal.read(cx).is_focused(window))
+            && (self.focused_terminal().is_some() || !self.placeholder_focus.is_focused(window))
     }
 
     fn reconcile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -901,6 +916,7 @@ impl Render for WorkspaceWorkbench {
             } else {
                 surface = surface.child(
                     div()
+                        .debug_selector(|| "workspace-pane-unavailable".into())
                         .p(px(18.0))
                         .text_color(colors.secondary)
                         .child("Session unavailable")

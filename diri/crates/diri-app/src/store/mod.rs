@@ -1890,27 +1890,37 @@ impl SessionStore {
         );
         let arriving_archived = session.is_archived();
         // Closing the tab also drops the Engine record and deletes the
-        // session's output log, so it may only happen where nothing is lost.
-        // A clean `exit 0` from something with no conversation to return to —
-        // a shell — is that case. A crash, a signal (macOS memory pressure
-        // kills agents with SIGTERM), or anything resumable stays listed with
-        // its exit pill and Resume button: that is the whole point of deriving
-        // resumability for exited sessions, and the scrollback is the only
-        // record of what went wrong.
-        let should_auto_close = !self.closing.contains(&id)
-            && matches!(
-                &session.status,
-                SessionStatus::Exited(info)
-                    if info.reason == ExitReason::Exited
-                        && info.code == Some(0)
-                        && !session.can_resume()
-            )
-            // A conversation Diri cannot re-enter (an agent without resume, a
-            // pruned transcript, Stop on an agent that exits 0) still has its
-            // scrollback as the only in-app record; only a tab that never
-            // bound a conversation is disposable.
+        // session's output log. A clean `exit 0` is the user ending the
+        // session: a shell's `exit`, or quitting a resumable agent (`/exit`,
+        // ^D), whose record ⇧⌘T reopens to Resume. Everything else stays
+        // listed with its exit pill, because its scrollback is the only record
+        // of what went wrong or of what was said: a crash, a signal (macOS
+        // memory pressure kills agents with SIGTERM), an agent that exits
+        // while still starting (a launch that failed quietly), or a
+        // conversation Diri cannot re-enter.
+        let clean_exit = matches!(
+            &session.status,
+            SessionStatus::Exited(info) if info.reason == ExitReason::Exited && info.code == Some(0)
+        );
+        // Nothing to return to: a tab that never bound a conversation.
+        let disposable = !session.can_resume()
             && session.agent_session_id.is_none()
-            && session.transcript_path.is_none()
+            && session.transcript_path.is_none();
+        let quit_after_running = session.can_resume()
+            && previous.as_deref().is_some_and(|record| {
+                matches!(
+                    record.status,
+                    SessionStatus::Idle | SessionStatus::Working | SessionStatus::NeedsInput(_)
+                )
+            });
+        let should_auto_close = !self.closing.contains(&id)
+            && !self.migrating.contains(&id)
+            && !self.auto_resuming.contains(&id)
+            && clean_exit
+            && (disposable || quit_after_running)
+            // Closing the tab closes its ⌘J terminals too, and an exit is no
+            // confirmation that a dev server running in one may go.
+            && !self.has_running_auxiliary(&id)
             && previous
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
@@ -2417,6 +2427,16 @@ impl SessionStore {
     /// their auxiliary terminals, which never outlive their parent. A shell
     /// already in `closing` was removed with its terminal tab; its record can
     /// still be here until the engine drops it, and must not be counted again.
+    /// A ⌘J terminal of `parent` whose process is still running.
+    fn has_running_auxiliary(&self, parent: &SessionId) -> bool {
+        self.sessions.values().any(|session| {
+            session.parent.as_ref() == Some(parent)
+                && is_auxiliary_terminal(session)
+                && !self.closing.contains(&session.id)
+                && !matches!(session.status, SessionStatus::Exited(_))
+        })
+    }
+
     pub(crate) fn closure_set(&self, ids: Vec<SessionId>) -> Vec<SessionId> {
         let mut ids = ids;
         let parents: HashSet<_> = ids.iter().cloned().collect();
