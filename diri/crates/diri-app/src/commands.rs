@@ -1075,9 +1075,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-shift-up"),
         Some("⌘⇧↑"),
         Some(TERMINAL_CONTEXT),
-        "Previous shell prompt",
+        "Previous message or shell prompt",
         "arrow.up",
-        "terminal prompt previous"
+        "terminal message prompt previous conversation"
     ),
     spec!(
         NextPrompt,
@@ -1085,9 +1085,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-shift-down"),
         Some("⌘⇧↓"),
         Some(TERMINAL_CONTEXT),
-        "Next shell prompt",
+        "Next message or shell prompt",
         "arrow.down",
-        "terminal prompt next"
+        "terminal message prompt next conversation"
     ),
 ];
 
@@ -1896,13 +1896,13 @@ impl CommandId {
                 category: ShortcutCategory::Terminal,
             },
             Self::PreviousPrompt => ShortcutMetadata {
-                title: "Previous shell prompt",
-                description: "Jump to the preceding OSC 133 shell prompt",
+                title: "Previous message or shell prompt",
+                description: "Jump to the preceding sent Agent message or marked shell prompt",
                 category: ShortcutCategory::Terminal,
             },
             Self::NextPrompt => ShortcutMetadata {
-                title: "Next shell prompt",
-                description: "Jump to the following OSC 133 shell prompt",
+                title: "Next message or shell prompt",
+                description: "Jump to the following sent Agent message or marked shell prompt",
                 category: ShortcutCategory::Terminal,
             },
             Self::CopySelection => ShortcutMetadata {
