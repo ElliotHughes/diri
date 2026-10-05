@@ -37,6 +37,7 @@ pub mod attention;
 pub mod boot;
 pub mod browser;
 pub mod checkpoint;
+pub mod cli_version;
 #[cfg(unix)]
 pub mod completed_terminal;
 pub mod control;
@@ -59,6 +60,7 @@ mod lifecycle;
 pub mod limits;
 pub mod local_path;
 pub mod log;
+pub mod mcp_http;
 pub mod migrate;
 pub mod pr_monitor;
 mod preview_mux;
