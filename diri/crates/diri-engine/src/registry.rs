@@ -755,6 +755,7 @@ impl Registry {
                     _ => None,
                 },
                 system_restart: false,
+                interrupted: false,
             });
         }
     }
@@ -1494,6 +1495,7 @@ impl Registry {
                     code: None,
                     signal: None,
                     system_restart: false,
+                    interrupted: false,
                 });
                 record.needs_input = None;
             }
@@ -3558,6 +3560,7 @@ mod tests {
             code: Some(255),
             signal: None,
             system_restart: false,
+            interrupted: false,
         });
         registry.records.insert("s_dead".into(), dead);
 
@@ -3643,6 +3646,7 @@ mod tests {
             code: Some(0),
             signal: None,
             system_restart: false,
+            interrupted: false,
         });
         registry.records.insert("s_dead".into(), dead);
 
@@ -5333,6 +5337,7 @@ mod tests {
             code: Some(0),
             signal: None,
             system_restart: false,
+            interrupted: false,
         });
         for record in [before, resumed, turned, done] {
             registry.records.insert(record.id.0.clone(), record);
@@ -5427,6 +5432,7 @@ mod tests {
                 code,
                 signal: None,
                 system_restart: false,
+                interrupted: false,
             });
             shell
         };

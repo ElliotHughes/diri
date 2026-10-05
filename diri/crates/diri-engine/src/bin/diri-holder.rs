@@ -87,6 +87,10 @@ fn main() {
             .map_or(Duration::from_secs(30), Duration::from_secs_f64);
         HolderManagerServer::new(std::path::Path::new(&directory), idle)
             .with_group_guard()
+            .with_agent_launcher(
+                value_after(&arguments, diri_engine::holder::AGENT_LAUNCHER_FLAG)
+                    .map(std::path::PathBuf::from),
+            )
             .run()
     } else if let Some(spec_path) = value_after(&arguments, "--spec") {
         match std::fs::read(&spec_path) {
