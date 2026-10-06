@@ -108,9 +108,21 @@ fn backlinks_and_unlinked_mentions_show_under_the_note(cx: &mut gpui::TestAppCon
 fn the_graph_shows_the_neighbourhood_or_every_note_and_settles(cx: &mut gpui::TestAppContext) {
     let fixture = fixture();
     let (pane, cx) = open(cx, &fixture, &fixture.plan);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("note-footer").is_some(),
+        "the note is drawn"
+    );
     pane.update_in(cx, |pane, window, cx| {
         pane.show_graph(graph::Scope::Local, window, cx)
     });
+    cx.run_until_parked();
+    // Under glass the graph's fill is clear: the note must not be drawn
+    // beneath it, or its text shows through the graph.
+    assert!(
+        cx.debug_bounds("note-footer").is_none(),
+        "the graph replaces the note"
+    );
     let graph = pane
         .read_with(cx, |pane, _| pane.graph_for_test())
         .expect("graph shown");
@@ -148,6 +160,12 @@ fn render_note_links_screenshot() {
         diri_ui::SemanticColors::dark()
     } else {
         diri_ui::SemanticColors::light()
+    };
+    let glass = std::env::var_os("DIRI_VISUAL_GLASS").is_some();
+    let colors = if glass {
+        colors.with_material(diri_ui::Material::Glass)
+    } else {
+        colors
     };
     let platform = gpui_platform::current_platform(true);
     let mut cx = HeadlessAppContext::with_platform(
@@ -221,7 +239,11 @@ fn render_note_links_screenshot() {
                     pane
                 });
                 *pane_slot.borrow_mut() = Some(pane.clone());
-                pane
+                cx.new(|_| ScreenshotHost {
+                    pane,
+                    colors,
+                    glass,
+                })
             }
         })
         .unwrap();
@@ -229,6 +251,9 @@ fn render_note_links_screenshot() {
     cx.update_window(window.into(), |_, window, cx| {
         pane.update(cx, |pane, cx| {
             pane.show(&SessionId::new("s_plan"), &plan, window, cx);
+            if glass {
+                pane.set_trailing_inset(GLASS_CONTROLS_INSET, cx);
+            }
             if let Some(footer) = pane.backlinks_for_test() {
                 footer.update(cx, |view, cx| view.expand_unlinked_for_test(cx));
             }
@@ -275,4 +300,80 @@ fn render_note_links_screenshot() {
     cx.update_window(window.into(), |_, window, _| window.remove_window())
         .unwrap();
     cx.run_until_parked();
+}
+
+/// Room the workbench keeps for a lone pane's split and inspector controls.
+#[cfg(target_os = "macos")]
+const GLASS_CONTROLS_INSET: f32 = diri_ui::Metrics::TOOLBAR_CONTROL_SIZE * 2.0 + 4.0;
+
+/// The note pane as a single workbench pane hosts it: under glass, over a
+/// stand-in wallpaper on the terminal's fill, with the pane's top-right
+/// controls drawn over it.
+#[cfg(target_os = "macos")]
+struct ScreenshotHost {
+    pane: Entity<NotePane>,
+    colors: diri_ui::SemanticColors,
+    glass: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Render for ScreenshotHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        use diri_ui::Metrics;
+        use gpui::px;
+        if !self.glass {
+            return div().size_full().child(self.pane.clone());
+        }
+        let colors = self.colors;
+        let blob = |left: f32, top: f32, size: f32, color: u32| {
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .size(px(size))
+                .rounded(px(size / 2.0))
+                .bg(gpui::rgba(color))
+        };
+        let control = div()
+            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(crate::icons::sf_symbol(
+                "rectangle.split.2x1",
+                14.0,
+                colors.secondary,
+            ));
+        div()
+            .relative()
+            .size_full()
+            .bg(gpui::rgba(0x2b3a4fff))
+            .child(blob(-80.0, -60.0, 420.0, 0x5d7f6cff))
+            .child(blob(620.0, 380.0, 460.0, 0x8a5a6cff))
+            .child(blob(380.0, 120.0, 260.0, 0x3f5f8aff))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(colors.terminal_surface())
+                    .child(self.pane.clone()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(
+                        (Metrics::TITLE_BAR - Metrics::TOOLBAR_CONTROL_SIZE) / 2.0
+                    ))
+                    .right(px(Metrics::TOOLBAR_EDGE_INSET))
+                    .flex()
+                    .gap(px(4.0))
+                    .child(control)
+                    .child(crate::right_panel::dispatching_toggle(
+                        "screenshot-toggle-inspector",
+                        false,
+                        colors,
+                        0.0,
+                    )),
+            )
+    }
 }
