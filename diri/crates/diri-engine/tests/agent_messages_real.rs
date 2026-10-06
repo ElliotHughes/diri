@@ -23,6 +23,13 @@
 //!   cargo test -p diri-engine --test agent_messages_real -- --ignored --nocapture --test-threads=1
 //! ```
 //!
+//! Codex starts a detached app-server daemon in that HOME on first launch.
+//! On drop the fixture ends every session first (a live Codex would relaunch
+//! the daemon), stops the daemon with its own managed binary's
+//! `app-server daemon stop`, then kills and reports anything still running
+//! from the temporary directory; one left running outlives its deleted HOME
+//! until reboot.
+//!
 //! `DIRI_INLINE=1` runs Codex with `--no-alt-screen`, recording its inline
 //! history instead. The tests set process-wide environment the Engine hands
 //! to its children, so they must run with `--test-threads=1`.
@@ -41,6 +48,9 @@ use diri_engine::registry::Registry;
 use diri_proto::ControlMessage;
 use diri_proto::grid::{GridCell, GridRowCodec, TermColor, TermStyle};
 use serde_json::{Value, json};
+
+#[path = "support/teardown.rs"]
+mod teardown;
 
 struct Client {
     writer: UnixStream,
@@ -162,14 +172,45 @@ fn describe(rows: &[Vec<GridCell>]) -> String {
 
 struct Fixture {
     temp: tempfile::TempDir,
+    home: PathBuf,
     project: PathBuf,
     api: Child,
+    registry: Option<Arc<Mutex<Registry>>>,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // Ends every session and waits for its exit, also after a test
+        // panicked before its own `session.kill`: a live Codex relaunches
+        // the daemon stopped below.
+        if let Some(registry) = &self.registry {
+            let mut registry = registry.lock().unwrap_or_else(|poison| poison.into_inner());
+            for record in registry.records() {
+                if let Err(error) = registry.terminate(&record.id.0, Duration::from_millis(500)) {
+                    eprintln!("teardown: session {} did not end: {error}", record.id.0);
+                }
+            }
+        }
+        // Codex's daemon is detached and outlives every tab; stop it before
+        // its HOME disappears, with the managed binary that runs it (the
+        // test's own PATH may hold another `codex`, or none). Absent when
+        // Codex never ran. CODEX_HOME would aim the stop at the developer's
+        // own daemon.
+        let codex = self
+            .home
+            .join(".codex/packages/app-server-daemon/current/bin/codex");
+        if codex.exists() {
+            teardown::stop_daemon(
+                &codex,
+                &["app-server", "daemon", "stop"],
+                &self.home,
+                "CODEX_HOME",
+            );
+        }
         let _ = self.api.kill();
         let _ = self.api.wait();
+        teardown::sweep(self.temp.path());
+        teardown::remove_tree(self.temp.path());
     }
 }
 
@@ -228,6 +269,7 @@ fn fixture() -> Fixture {
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-fake-key-for-diri-e2e-0000");
         for name in [
             "OPENAI_API_KEY",
+            "CODEX_HOME",
             "OPENCODE_CONFIG",
             "OPENCODE_CONFIG_CONTENT",
         ] {
@@ -312,7 +354,13 @@ fn fixture() -> Fixture {
         .to_string(),
     )
     .unwrap();
-    Fixture { temp, project, api }
+    Fixture {
+        temp,
+        home,
+        project,
+        api,
+        registry: None,
+    }
 }
 
 fn which(name: &str) -> Result<PathBuf, ()> {
@@ -324,7 +372,9 @@ fn which(name: &str) -> Result<PathBuf, ()> {
         .ok_or(())
 }
 
-fn start_with_registry(temp: &Path) -> (Client, Arc<Mutex<Registry>>) {
+/// Starts a private Engine in the fixture, which ends its sessions on drop.
+fn start_with_registry(fixture: &mut Fixture) -> (Client, Arc<Mutex<Registry>>) {
+    let temp = fixture.temp.path();
     let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .unwrap();
@@ -333,6 +383,7 @@ fn start_with_registry(temp: &Path) -> (Client, Arc<Mutex<Registry>>) {
         Arc::new(engine),
         temp.join("state.json"),
     )));
+    fixture.registry = Some(Arc::clone(&registry));
     let shared = Arc::clone(&registry);
     let server = Arc::new(
         ControlServer::new(Arc::clone(&registry), temp.join("daemon.sock"))
@@ -437,8 +488,8 @@ fn ansi(rows: &[Vec<GridCell>], scrub: &[(&str, &str)]) -> String {
 fn record_message_fixtures() {
     let agents = std::env::var("DIRI_AGENTS").unwrap_or_else(|_| "codex".into());
     let out = PathBuf::from(std::env::var("DIRI_DUMP_DIR").unwrap());
-    let fixture = fixture();
-    let (mut client, registry) = start_with_registry(fixture.temp.path());
+    let mut fixture = fixture();
+    let (mut client, registry) = start_with_registry(&mut fixture);
     let project = fixture.project.display().to_string();
     let temp = fixture
         .temp
@@ -532,8 +583,8 @@ fn record_message_fixtures() {
 #[ignore = "measurement: needs real Agent CLIs on PATH"]
 fn measure_wheel_response() {
     let agents = std::env::var("DIRI_AGENTS").unwrap_or_else(|_| "claude-code".into());
-    let fixture = fixture();
-    let (mut client, registry) = start_with_registry(fixture.temp.path());
+    let mut fixture = fixture();
+    let (mut client, registry) = start_with_registry(&mut fixture);
     for agent in agents.split(',') {
         let record = client
             .call(
@@ -626,8 +677,8 @@ fn measure_wheel_response() {
 #[ignore = "measurement: needs real Agent CLIs on PATH"]
 fn measure_burst_curve() {
     let agents = std::env::var("DIRI_AGENTS").unwrap_or_else(|_| "claude-code".into());
-    let fixture = fixture();
-    let (mut client, registry) = start_with_registry(fixture.temp.path());
+    let mut fixture = fixture();
+    let (mut client, registry) = start_with_registry(&mut fixture);
     for agent in agents.split(',') {
         let record = client
             .call(
@@ -711,8 +762,8 @@ fn measure_burst_curve() {
 #[test]
 #[ignore = "measurement: needs real Agent CLIs on PATH"]
 fn measure_claude_page_keys() {
-    let fixture = fixture();
-    let (mut client, registry) = start_with_registry(fixture.temp.path());
+    let mut fixture = fixture();
+    let (mut client, registry) = start_with_registry(&mut fixture);
     let record = client
         .call(
             "session.spawn",
