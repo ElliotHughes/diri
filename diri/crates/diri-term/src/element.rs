@@ -19,6 +19,7 @@ use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
 };
+use crate::inline_images::{DrawGrid, ImageDraw, InlineImageCache, append_row_draws};
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
     ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
@@ -391,6 +392,9 @@ struct ElementSharedState {
     /// Advances whenever the user types, scrolls or starts a selection, so a
     /// jump in flight can tell it no longer owns the view.
     interactions: AtomicU64,
+    /// Decoded inline images; empty and inert until a host installs a
+    /// requester.
+    inline_images: Arc<InlineImageCache>,
 }
 
 /// Rows an OSC 133 end is looked for below the window, so a prompt near the
@@ -722,6 +726,8 @@ pub struct TerminalPrepaintState {
     /// composed copies, so an unchanged frame clones nothing.
     paint_from_cache: bool,
     scroll: Option<ScrollPaint>,
+    /// Inline images over the rows that carry them, already scrolled.
+    images: Vec<ImageDraw>,
 }
 
 /// A reading view resting between rows. Everything row-positioned is built
@@ -803,6 +809,7 @@ impl TerminalElement {
                 message_flash: Mutex::new(None),
                 command_marks: Mutex::default(),
                 interactions: AtomicU64::new(0),
+                inline_images: Arc::default(),
             }),
             theme: TermTheme::default(),
             background_opacity: 1.0,
@@ -818,6 +825,13 @@ impl TerminalElement {
             reduce_motion: false,
             cursor_hidden: false,
         }
+    }
+
+    /// This terminal's inline-image cache, for the host to install a
+    /// requester and deliver decoded images. Clones share it.
+    #[must_use]
+    pub fn inline_images(&self) -> Arc<InlineImageCache> {
+        Arc::clone(&self.shared.inline_images)
     }
 
     #[must_use]
@@ -1560,6 +1574,11 @@ impl TerminalElement {
             .iter()
             .find(|link| usize::from(link.start) <= col && col < usize::from(link.end))
         {
+            // An inline image's cells are not a link, and their blanks hold
+            // nothing to resolve either.
+            if diri_proto::inline_image::is_anchor(&link.uri) {
+                return None;
+            }
             return reference_from_run(&link.uri).map(|reference| ReferenceHit {
                 reference,
                 spans: vec![(absolute_row, usize::from(link.start), usize::from(link.end))],
@@ -2325,6 +2344,7 @@ impl Element for TerminalElement {
                 cache_misses: 0,
                 paint_from_cache: false,
                 scroll: None,
+                images: Vec::new(),
             };
         }
 
@@ -2353,6 +2373,7 @@ impl Element for TerminalElement {
                 cache_misses: 0,
                 paint_from_cache: false,
                 scroll: None,
+                images: Vec::new(),
             };
         }
 
@@ -2783,6 +2804,31 @@ impl Element for TerminalElement {
         };
         let cursor = self.animate_cursor(cursor, focused, metrics, visible_cols, window);
 
+        // Rows carry their images' anchors; most carry no links at all.
+        let mut images = Vec::new();
+        {
+            let buffer = read_lock(&self.buffer);
+            let grid = DrawGrid {
+                origin: point(bounds.left(), bounds.top() - scroll_shift),
+                cell_width: metrics.cell_width,
+                line_height: metrics.line_height,
+                visible_cols,
+                scale_factor: window.scale_factor(),
+            };
+            for window_row in 0..painted_rows {
+                let links = viewport.row_links(&buffer, viewport.absolute_row(window_row));
+                if !links.is_empty() {
+                    append_row_draws(
+                        &self.shared.inline_images,
+                        links,
+                        window_row,
+                        grid,
+                        &mut images,
+                    );
+                }
+            }
+        }
+
         let scroll = (scroll_shift > px(0.0)).then(|| {
             let backdrop = background_quads.remove(0);
             for quad in background_quads
@@ -2825,6 +2871,7 @@ impl Element for TerminalElement {
             cache_misses,
             paint_from_cache,
             scroll,
+            images,
         }
     }
 
@@ -3048,6 +3095,16 @@ impl Element for TerminalElement {
                     shape.paint(window);
                 }
             });
+
+            for image in self.shared.inline_images.take_retired() {
+                let _ = window.drop_image(image);
+            }
+            for draw in prepaint.images.drain(..) {
+                window.with_content_mask(Some(ContentMask { bounds: draw.clip }), |window| {
+                    let _ =
+                        window.paint_image(draw.bounds, Default::default(), draw.image, 0, false);
+                });
+            }
 
             let cursor_schedule = prepaint
                 .cursor

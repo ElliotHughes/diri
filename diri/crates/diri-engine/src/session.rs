@@ -412,6 +412,9 @@ struct Shared {
     prompt_input: Mutex<PromptInputState>,
     log: Mutex<OutputLog>,
     screen: Mutex<HeadlessScreen>,
+    /// Device pixels per cell this session's terminal sizes images with, so
+    /// the PTY can report its text area in pixels; `None` for remote.
+    cell_pixels: Option<(u16, u16)>,
     /// The newest size the PTY was given whose emulator reflow has not run
     /// yet. See [`MirrorResize`].
     requested_size: Mutex<Option<(u16, u16)>>,
@@ -1966,6 +1969,8 @@ impl Session {
 
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
+        let (cols, rows) = (spec.pty.cols, spec.pty.rows);
+        let _ = pty.resize_with_pixels(cols, rows, launch_pixels(cols, rows));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, true);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
@@ -2027,6 +2032,11 @@ impl Session {
         let client = HolderClient::new(paths.socket());
         let (floor, stat) = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
+        let _ = client.resize_with_pixels(
+            launch.cols,
+            launch.rows,
+            launch_pixels(launch.cols, launch.rows),
+        );
         Self::attach(spec, client, floor, engine, true, stat.as_ref())
     }
 
@@ -2120,6 +2130,13 @@ impl Session {
                         cols = pty.cols,
                         rows = pty.rows,
                     );
+                    // The launch spec carries no pixel size; an older Holder
+                    // manager would not pass one on.
+                    let _ = client.resize_with_pixels(
+                        pty.cols,
+                        pty.rows,
+                        text_area_pixels(&shared, pty.cols, pty.rows),
+                    );
                     if return_to_shell {
                         watch_early_return_to_shell(&shared, &client);
                     }
@@ -2149,7 +2166,12 @@ impl Session {
                     if let Some((cols, rows)) = handoff.late_size {
                         // A size proposed while the exec was in flight: apply
                         // as an ordinary resize now that the PTY exists.
-                        let _ = client.resize(cols.max(2), rows.max(2));
+                        let (cols, rows) = (cols.max(2), rows.max(2));
+                        let _ = client.resize_with_pixels(
+                            cols,
+                            rows,
+                            text_area_pixels(&shared, cols, rows),
+                        );
                         shared
                             .screen
                             .lock()
@@ -3211,6 +3233,12 @@ impl Session {
         self.shared.reset_generation.load(Ordering::SeqCst)
     }
 
+    /// An inline image this session's terminal placed, by anchor key.
+    /// `None` for a remote session, an unknown key or an evicted image.
+    pub fn inline_image(&self, key: &str) -> Option<diri_terminal_state::StoredImage> {
+        self.shared.screen.lock().expect("screen").inline_image(key)
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         if let Some(reflow) = self.resize_pty(cols, rows)? {
             reflow.apply();
@@ -3232,9 +3260,15 @@ impl Session {
         {
             return Ok(None);
         }
+        let pixels = text_area_pixels(&self.shared, cols, rows);
         match &self.transport {
-            Transport::Direct(pty) => pty.lock().expect("pty").resize(cols, rows)?,
-            Transport::Held(client) => client.resize(cols, rows).map_err(holder_io_error)?,
+            Transport::Direct(pty) => pty
+                .lock()
+                .expect("pty")
+                .resize_with_pixels(cols, rows, pixels)?,
+            Transport::Held(client) => client
+                .resize_with_pixels(cols, rows, pixels)
+                .map_err(holder_io_error)?,
             Transport::Remote(client) => client.resize(cols, rows)?,
         }
         // Recorded in PTY order: callers resize the PTY under the Registry
@@ -3372,6 +3406,23 @@ impl Drop for Session {
     }
 }
 
+/// The PTY's text area in pixels (`ws_xpixel`/`ws_ypixel`): what image tools
+/// such as `kitten icat` size their output from. Zero where unknown.
+fn text_area_pixels(shared: &Shared, cols: u16, rows: u16) -> (u16, u16) {
+    shared
+        .cell_pixels
+        .map_or((0, 0), |cell| scale_cells(cell, cols, rows))
+}
+
+/// [`text_area_pixels`] for a local PTY spawned before its session state.
+fn launch_pixels(cols: u16, rows: u16) -> (u16, u16) {
+    scale_cells(diri_terminal_state::DEFAULT_CELL_PIXELS, cols, rows)
+}
+
+fn scale_cells((width, height): (u16, u16), cols: u16, rows: u16) -> (u16, u16) {
+    (cols.saturating_mul(width), rows.saturating_mul(height))
+}
+
 fn new_shared(
     spec: &SessionSpec,
     log: OutputLog,
@@ -3427,10 +3478,23 @@ fn new_shared(
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
-        screen: Mutex::new(
-            HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
-                .with_notifications(),
-        ),
+        screen: Mutex::new({
+            let screen = HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
+                .with_notifications();
+            // Only a local session's own emulator feeds the client grid; a
+            // remote session's grid comes from its Holder, which has no
+            // image support, so storing images here would cost memory for
+            // pixels nobody can see.
+            if spec.remote.is_none() {
+                screen.with_inline_images()
+            } else {
+                screen
+            }
+        }),
+        cell_pixels: spec
+            .remote
+            .is_none()
+            .then_some(diri_terminal_state::DEFAULT_CELL_PIXELS),
         requested_size: Mutex::new(None),
         reducer: Mutex::new(reducer),
         exit: Mutex::new(None),
