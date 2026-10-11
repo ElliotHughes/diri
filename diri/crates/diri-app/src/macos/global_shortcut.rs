@@ -283,7 +283,7 @@ pub(crate) fn install(cx: &mut App, prefs: &Prefs) {
         let mut sender = Box::new(sender);
         let event = EventType {
             class: u32::from_be_bytes(*b"keyb"),
-            kind: 6,
+            kind: 5, // kEventHotKeyPressed
         };
         // SAFETY: Carbon borrows a stable Box, retained until handler removal.
         let status = unsafe {
