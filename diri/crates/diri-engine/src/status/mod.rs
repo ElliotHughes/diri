@@ -53,6 +53,10 @@ pub struct ReducerTiming {
     /// read counts as a question. A prompt is printed and then waits; a job
     /// that reads between bursts of output is not asking anything.
     pub line_prompt_settle: Duration,
+    /// How long after a submit a `stale_after_submit` screen is still taken
+    /// for the previous turn's composer. Past it, that screen can end the turn
+    /// again, so a turn too fast to show any working evidence still finishes.
+    pub submit_chrome_hold: Duration,
 }
 
 impl Default for ReducerTiming {
@@ -65,6 +69,7 @@ impl Default for ReducerTiming {
             blocker_clear_scans: 2,
             staleness_timeout: Duration::from_secs(60),
             line_prompt_settle: Duration::from_millis(750),
+            submit_chrome_hold: Duration::from_secs(10),
         }
     }
 }
@@ -103,9 +108,14 @@ pub enum StatusSignal {
     },
     CodexTurnComplete,
     /// Cursor jsonl tail: last object is a user prompt or `tool_use`.
-    CursorTranscriptWorking,
+    /// `bytes` is the transcript's size, which tells turns apart.
+    CursorTranscriptWorking {
+        bytes: u64,
+    },
     /// Cursor jsonl tail: last object is assistant text or `turn_ended`.
-    CursorTranscriptIdle,
+    CursorTranscriptIdle {
+        bytes: u64,
+    },
     Screen(ScreenObservation),
     PtyOutputActivity,
     UserKeystroke,
@@ -213,6 +223,18 @@ struct InternalState {
     /// the transcript shows work again — cursor-agent does not update the
     /// title to Ready at end of turn.
     hold_idle_against_screen: bool,
+    /// The last submit, while a `stale_after_submit` screen may still be the
+    /// previous turn's composer. Cleared by evidence that this turn started
+    /// or ended, or after [`ReducerTiming::submit_chrome_hold`].
+    submitted_at: Option<SystemTime>,
+    /// Flags of the rule behind [`Self::screen_belief`].
+    last_stale_after_submit: bool,
+    last_turn_started: bool,
+    /// Size of the Cursor transcript at its last poll.
+    cursor_transcript_bytes: Option<u64>,
+    /// The transcript size at submit. An idle tail of exactly this size is
+    /// the previous turn's; any growth means this turn reached the file.
+    cursor_stale_transcript_bytes: Option<u64>,
     /// The last output or keystroke on a shell's terminal, which a line
     /// read must outlast by [`ReducerTiming::line_prompt_settle`].
     terminal_active_at: SystemTime,
@@ -242,6 +264,11 @@ impl InternalState {
             responding_since: None,
             pending_needs_input: None,
             hold_idle_against_screen: false,
+            submitted_at: None,
+            last_stale_after_submit: false,
+            last_turn_started: false,
+            cursor_transcript_bytes: None,
+            cursor_stale_transcript_bytes: None,
             terminal_active_at: spawned_at,
         }
     }
@@ -611,8 +638,8 @@ impl StatusReducer {
                 | StatusSignal::TerminalLine(_)
                 | StatusSignal::Tick
                 | StatusSignal::CodexTurnComplete
-                | StatusSignal::CursorTranscriptWorking
-                | StatusSignal::CursorTranscriptIdle => {
+                | StatusSignal::CursorTranscriptWorking { .. }
+                | StatusSignal::CursorTranscriptIdle { .. } => {
                     self.state.last_signal_at = now;
                     return outcome;
                 }
@@ -657,10 +684,12 @@ impl StatusReducer {
 
         let evidence_hint = match &signal {
             StatusSignal::ClaudeHook { .. } => Some((StatusEvidenceSource::Hook, None, None)),
-            StatusSignal::CodexTurnComplete | StatusSignal::CursorTranscriptIdle => {
+            StatusSignal::CodexTurnComplete | StatusSignal::CursorTranscriptIdle { .. } => {
                 Some((StatusEvidenceSource::Notify, None, None))
             }
-            StatusSignal::CursorTranscriptWorking => Some((StatusEvidenceSource::Hook, None, None)),
+            StatusSignal::CursorTranscriptWorking { .. } => {
+                Some((StatusEvidenceSource::Hook, None, None))
+            }
             StatusSignal::Screen(observation) => Some((
                 StatusEvidenceSource::ScreenRule,
                 Some(observation.matched_rule_id.clone()),
@@ -690,6 +719,15 @@ impl StatusReducer {
             StatusSignal::UserKeystroke | StatusSignal::UserSubmission => {
                 self.state.last_signal_at = now;
                 self.state.hold_idle_against_screen = false;
+                if matches!(signal, StatusSignal::UserSubmission) {
+                    // The composer and transcript tail on screen still belong
+                    // to the previous turn. Neither may finish this one.
+                    self.state.submitted_at = Some(now);
+                    self.state.cursor_stale_transcript_bytes = self.state.cursor_transcript_bytes;
+                    if self.state.last_stale_after_submit {
+                        self.cancel_idle_candidacy();
+                    }
+                }
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
                     self.state.responding_since = Some(now);
                 }
@@ -703,21 +741,27 @@ impl StatusReducer {
                 self.state.last_signal_at = now;
                 self.handle_strong_idle(now, &mut outcome);
             }
-            StatusSignal::CursorTranscriptWorking => {
+            StatusSignal::CursorTranscriptWorking { bytes } => {
+                self.note_cursor_transcript(bytes);
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
                     return outcome;
                 }
                 self.go_working(now, false, &mut outcome);
             }
-            StatusSignal::CursorTranscriptIdle => {
+            StatusSignal::CursorTranscriptIdle { bytes } => {
                 self.state.last_signal_at = now;
+                self.note_cursor_transcript(bytes);
+                // A submit can race the previous turn's tail. Until the file
+                // grows, that idle belongs to the turn that just ended.
+                let previous_turn = self.state.cursor_stale_transcript_bytes == Some(bytes);
                 // The poll can still see the preceding turn's transcript while
                 // Cursor streams the next one. Its live spinner is stronger
                 // evidence than that tail. Keep the transcript fallback for OSC
                 // titles, which older Cursor versions can leave stale.
                 let live_spinner = self.state.screen_belief == Some(ManifestState::Working)
-                    && self.state.last_matched_rule_id.as_deref() == Some("working-status-line");
-                if self.status == SessionStatus::Working && !live_spinner {
+                    && self.state.last_turn_started;
+                if self.status == SessionStatus::Working && !previous_turn && !live_spinner {
+                    self.state.submitted_at = None;
                     self.state.hold_idle_against_screen = true;
                     self.handle_strong_idle(now, &mut outcome);
                 }
@@ -1215,6 +1259,22 @@ impl StatusReducer {
         self.state.pending_turn_completed = false;
     }
 
+    fn note_cursor_transcript(&mut self, bytes: u64) {
+        self.state.cursor_transcript_bytes = Some(bytes);
+        if self.state.cursor_stale_transcript_bytes != Some(bytes) {
+            self.state.cursor_stale_transcript_bytes = None;
+        }
+    }
+
+    /// Whether the screen on display may be the composer left over from
+    /// before the last submit.
+    fn showing_submit_chrome(&self, now: SystemTime) -> bool {
+        self.state.last_stale_after_submit
+            && self.state.submitted_at.is_some_and(|at| {
+                now.duration_since(at).unwrap_or_default() < self.timing.submit_chrome_hold
+            })
+    }
+
     /// Enter or refresh `working` from a positive work signal. For
     /// hooks-primary agents a work hook also clears a stale on-screen blocker.
     fn go_working(
@@ -1500,9 +1560,13 @@ impl StatusReducer {
         self.state.last_screen_seq = Some(observation.content_seq);
         self.state.screen_belief = Some(observation.state);
         self.state.last_matched_rule_id = Some(observation.matched_rule_id.clone());
+        self.state.last_stale_after_submit = observation.stale_after_submit;
+        self.state.last_turn_started = observation.turn_started;
 
         // A visible blocker beats everything except process exit.
         if let Some(kind) = needs_input_kind(observation.state) {
+            // A blocker is this turn's own screen, so later idle is real.
+            self.state.submitted_at = None;
             self.state.screen_blocker_active = true;
             self.state.blocker_miss_scans = 0;
             self.state.blocker_miss_since = None;
@@ -1560,9 +1624,24 @@ impl StatusReducer {
                 if self.state.hold_idle_against_screen {
                     return;
                 }
+                // A `turn_started` screen (Cursor's Generating/Thinking line)
+                // proves the submitted turn is running. A stale Working OSC
+                // title does not: the composer below can still be the
+                // previous turn.
+                if self.state.last_turn_started {
+                    self.state.submitted_at = None;
+                }
                 self.go_working(now, false, outcome);
             }
             ManifestState::Idle => {
+                if self.status == SessionStatus::Working && self.showing_submit_chrome(now) {
+                    return;
+                }
+                if !self.state.last_stale_after_submit {
+                    // An idle screen the submit could not have left behind,
+                    // such as a Ready title, is this turn ending.
+                    self.state.submitted_at = None;
+                }
                 if self.status == SessionStatus::Working {
                     self.confirm_idle(now, outcome);
                 } else if self.status == SessionStatus::Starting {
@@ -1629,6 +1708,22 @@ impl StatusReducer {
             self.state.blocker_miss_scans = 0;
             self.state.blocker_miss_since = None;
             self.apply_non_blocker_screen(state, now, true, outcome);
+        }
+
+        // Leftover composer chrome held back after a submit counts once the
+        // hold expires, so a turn that showed no working screen still ends.
+        if let Some(at) = self.state.submitted_at
+            && now.duration_since(at).unwrap_or_default() >= self.timing.submit_chrome_hold
+        {
+            self.state.submitted_at = None;
+            if self.status == SessionStatus::Working
+                && !self.state.screen_blocker_active
+                && !self.state.skip_active
+                && self.state.last_stale_after_submit
+                && self.state.screen_belief == Some(ManifestState::Idle)
+            {
+                self.confirm_idle(now, outcome);
+            }
         }
 
         // Running but unreadable for long enough becomes unknown rather than a

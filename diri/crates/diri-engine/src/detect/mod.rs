@@ -44,6 +44,11 @@ pub struct ScreenObservation {
     pub content_seq: u64,
     pub prompt_excerpt: Option<String>,
     pub options: Option<Vec<String>>,
+    /// The rule's `stale_after_submit` flag: right after a submit this screen
+    /// can still be the previous turn's composer, so it cannot end the new one.
+    pub stale_after_submit: bool,
+    /// The rule's `turn_started` flag: proof the submitted turn is running.
+    pub turn_started: bool,
 }
 
 /// Immutable manifest storage, built once and shared across sessions.
@@ -254,6 +259,8 @@ impl ManifestEngine {
             content_seq: snapshot.content_seq,
             prompt_excerpt: excerpt,
             options,
+            stale_after_submit: rule.has_flag("stale_after_submit"),
+            turn_started: rule.has_flag("turn_started"),
         })
     }
 }
@@ -1794,7 +1801,7 @@ mod tests {
         }
     }
 
-    /// Real 100x30 screens from cursor-agent 2026.09.28-64d2043 through
+    /// Real 100x30 screens from cursor-agent 2026.10.01-14929f9 through
     /// tests/cursor_real.rs, default zen UI (OSC status indicators off).
     #[test]
     fn cursor_rules_match_the_screens_cursor_cli_draws() {
@@ -1825,9 +1832,14 @@ mod tests {
                 ManifestState::BlockedPermission,
                 "confirm-dialog",
             ),
-            // The accepted trust dialog stays above this composer; it must not stick.
             (
                 include_str!("../../tests/fixtures/cursor_screens/idle.txt"),
+                ManifestState::Idle,
+                "idle-follow-up-placeholder",
+            ),
+            // The answered trust box stays above the composer; it must not stick.
+            (
+                include_str!("../../tests/fixtures/cursor_screens/trusted.txt"),
                 ManifestState::Idle,
                 "idle-follow-up-placeholder",
             ),
@@ -1895,6 +1907,72 @@ mod tests {
         let observation = engine.evaluate(&idle_prompt, "cursor").expect("match");
         assert_eq!(observation.state, ManifestState::Idle);
         assert_eq!(observation.matched_rule_id, "idle-prompt-arrow");
+    }
+
+    #[test]
+    fn cursor_permission_prompts_from_2026_10_01_still_block() {
+        let engine = engine();
+        for prompt in [
+            "Run this command?",
+            "Run this command outside the sandbox?",
+            "Read this file?",
+            "Allow this web search?",
+            "Allow this web fetch?",
+            "Proceed with this edit?",
+        ] {
+            let observation = engine
+                .evaluate(
+                    &cursor_snapshot(&[prompt, "→ Run (once) (y)"], None),
+                    "cursor",
+                )
+                .expect(prompt);
+            assert_eq!(
+                observation.state,
+                ManifestState::BlockedPermission,
+                "{prompt}"
+            );
+            assert_eq!(observation.matched_rule_id, "confirm-dialog", "{prompt}");
+        }
+        // The same words inside a prompt or reply are not a dialog.
+        let prose = engine
+            .evaluate(
+                &cursor_snapshot(
+                    &[
+                        "can you read this file? and allow this web fetch?",
+                        "⠠⠜ Generating",
+                    ],
+                    None,
+                ),
+                "cursor",
+            )
+            .expect("working");
+        assert_eq!(prose.state, ManifestState::Working);
+    }
+
+    /// Composer chrome may be the previous turn's right after Enter; the
+    /// status line proves the new one started. The reducer reads these flags.
+    #[test]
+    fn cursor_rules_flag_submit_chrome_and_turn_start() {
+        let engine = engine();
+        let evaluate = |lines: &[&str]| {
+            engine
+                .evaluate(&cursor_snapshot(lines, None), "cursor")
+                .expect("match")
+        };
+        let arrow = evaluate(&["→ Add a follow-up"]);
+        assert!(arrow.stale_after_submit && !arrow.turn_started);
+        let placeholder = evaluate(&["→ Plan, search, build anything"]);
+        assert!(placeholder.stale_after_submit);
+        let working = evaluate(&["⠠⠜ Generating", "→ Add a follow-up"]);
+        assert!(working.turn_started && !working.stale_after_submit);
+        let ready = engine
+            .evaluate(
+                &cursor_snapshot(&["→ Add a follow-up"], Some("Chat - Ready")),
+                "cursor",
+            )
+            .expect("ready");
+        assert_eq!(ready.matched_rule_id, "idle-osc-title");
+        assert!(!ready.stale_after_submit);
     }
 
     #[test]

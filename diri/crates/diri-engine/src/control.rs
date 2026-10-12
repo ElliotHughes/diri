@@ -6419,14 +6419,7 @@ fn prepare_cursor_input(
                 .map_err(|_| InitialPromptFailure::InputFailed)?;
                 accepted = true;
             }
-        } else if crate::detect::bottom_non_empty(&lines, 8)
-            .iter()
-            .any(|line| {
-                let line = line.trim();
-                line.starts_with("→ Plan, search, build anything")
-                    || line.starts_with("→ Add a follow-up")
-            })
-        {
+        } else if cursor_composer_ready(&lines) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -6434,11 +6427,28 @@ fn prepare_cursor_input(
     Err(InitialPromptFailure::SubmissionUnconfirmed)
 }
 
+fn cursor_composer_ready(lines: &[String]) -> bool {
+    !is_cursor_workspace_trust_screen(lines)
+        && crate::detect::bottom_non_empty(lines, 8)
+            .iter()
+            .any(|line| {
+                let line = line.trim();
+                line.starts_with("→ Plan, search, build anything")
+                    || line.starts_with("→ Add a follow-up")
+            })
+}
+
+/// The selector is live only while an option carries the `▶` marker. Once
+/// answered, cursor-agent 2026.10.01-14929f9 repaints the box without it and
+/// with `Trusting workspace...`, then leaves that box above the composer as
+/// stale paint. The footer is not required: a composer painted under the
+/// dialog can push it out of view.
 fn is_cursor_workspace_trust_screen(lines: &[String]) -> bool {
-    let bottom = crate::detect::bottom_non_empty(lines, 8).join("\n");
-    bottom.contains("[a] Trust this workspace")
-        && bottom.contains("[q] Quit")
-        && bottom.contains("Use arrow keys to navigate, Enter to select, or press the key shown")
+    let has = |needle: &str| lines.iter().any(|line| line.contains(needle));
+    has("[a] Trust this workspace")
+        && has("[q] Quit")
+        && (has("▶ [a] Trust this workspace") || has("▶ [q] Quit"))
+        && !has("Trusting workspace")
 }
 
 /// Types and submits an initial prompt at most once. Screen observations can
@@ -9137,6 +9147,8 @@ mod tests {
                             content_seq: 1,
                             prompt_excerpt: None,
                             options: None,
+                            stale_after_submit: false,
+                            turn_started: false,
                         },
                     ));
             }
@@ -10092,14 +10104,35 @@ mod tests {
     #[test]
     fn cursor_trust_requires_the_live_selector() {
         let lines = |screen: &str| screen.lines().map(str::to_owned).collect::<Vec<_>>();
-        assert!(is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/trust.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
+        let waiting = lines(include_str!("../tests/fixtures/cursor_screens/trust.txt"));
+        assert!(is_cursor_workspace_trust_screen(&waiting));
+        assert!(!cursor_composer_ready(&waiting));
+        // A build that paints the composer under the dialog and no footer.
+        let footerless = include_str!("../tests/fixtures/cursor_screens/trust.txt").replace(
+            "Use arrow keys to navigate, Enter to select, or press the key shown",
+            "",
+        ) + "  Cursor Agent\n  → Plan, search, build anything\n  Diri Fake\n";
+        let footerless = lines(&footerless);
+        assert!(is_cursor_workspace_trust_screen(&footerless));
+        assert!(
+            !cursor_composer_ready(&footerless),
+            "the composer under the dialog is not the input target"
+        );
+        // After `a` the box stays as stale paint above a composer that works.
+        let answered = lines(include_str!("../tests/fixtures/cursor_screens/trusted.txt"));
+        assert!(!is_cursor_workspace_trust_screen(&answered));
+        assert!(cursor_composer_ready(&answered));
+        for other in [
+            include_str!("../tests/fixtures/cursor_screens/idle.txt"),
+            include_str!("../tests/fixtures/cursor_screens/login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/browser-login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/working.txt"),
+        ] {
+            let screen = lines(other);
+            assert!(!is_cursor_workspace_trust_screen(&screen), "{other}");
+        }
+        assert!(cursor_composer_ready(&lines(include_str!(
             "../tests/fixtures/cursor_screens/idle.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/login.txt"
         ))));
     }
 
