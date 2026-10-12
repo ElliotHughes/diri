@@ -983,6 +983,10 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// The pane is a comfortable-density island: its fills round their outer
+    /// corners, because GPUI clips children to rectangles, not to the
+    /// island's rounded edge.
+    island_corners: bool,
     /// This frame's hold-⌘ hint opacity, sampled at render.
     held_hint: f32,
     /// The workbench hosts this pane's title-bar actions elsewhere (the
@@ -1249,6 +1253,7 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            island_corners: false,
             held_hint: 0.0,
             header_hidden: false,
             navigation: None,
@@ -1834,6 +1839,13 @@ impl TerminalPane {
         cx.notify();
     }
 
+    pub fn set_island_corners(&mut self, island: bool, cx: &mut Context<Self>) {
+        if self.island_corners != island {
+            self.island_corners = island;
+            cx.notify();
+        }
+    }
+
     /// Drop the pane's own title bar because the workbench hosts its actions
     /// in the horizontal tab strip. Grid geometry follows on the next layout.
     pub fn set_header_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
@@ -1857,6 +1869,17 @@ impl TerminalPane {
     pub(crate) fn header_height(&self) -> f32 {
         if self.header_hidden {
             0.0
+        } else {
+            self.title_bar_height()
+        }
+    }
+
+    /// The pane's title bar. An island is inset by the gap at the top, so its
+    /// bar gives up the gap twice and stays centred on the window's toolbar
+    /// line, level with the traffic lights and the sidebar's buttons.
+    fn title_bar_height(&self) -> f32 {
+        if self.island_corners {
+            island_title_bar()
         } else {
             Metrics::TITLE_BAR
         }
@@ -4431,9 +4454,18 @@ impl TerminalPane {
 
     /// The top-left pane owns the native window-button lane when navigation
     /// chrome is hidden, including panes mounted by a saved split layout.
-    fn occupies_window_titlebar(&self) -> bool {
+    /// How far in from the window's left edge the pane starts when its
+    /// title bar shares the traffic lights' row: 0 when flush (compact),
+    /// the island gap in comfortable. `None` when the lights are elsewhere.
+    fn window_titlebar_inset(&self) -> Option<f32> {
+        // The lights start 20 pt in and are centred on the title bar.
         self.viewport
-            .is_some_and(|viewport| viewport.x < 0.5 && viewport.y < 0.5)
+            .filter(|viewport| viewport.x < 20.0 && viewport.y < Metrics::TITLE_BAR / 2.0)
+            .map(|viewport| viewport.x)
+    }
+
+    fn occupies_window_titlebar(&self) -> bool {
+        self.window_titlebar_inset().is_some()
     }
 
     fn shows_navigation_control(&self) -> bool {
@@ -4461,8 +4493,13 @@ impl TerminalPane {
             .gap(px(Metrics::TOOLBAR_ITEM_GAP))
             // The visible lights need more breathing room than their native
             // frames imply, so this is an intentional optical safe area.
-            .when(self.occupies_window_titlebar(), |control| {
-                control.child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
+            .when_some(self.window_titlebar_inset(), |control, inset| {
+                // Clear the lights at the same window x in every density.
+                control.child(
+                    div()
+                        .w(px((Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE - inset).max(0.0)))
+                        .flex_none(),
+                )
             })
             .child(crate::held_hints::below(
                 div()
@@ -4522,7 +4559,7 @@ impl TerminalPane {
             .viewport
             .map_or(f32::INFINITY, |viewport| viewport.width);
         div()
-            .h(px(Metrics::TITLE_BAR))
+            .h(px(self.title_bar_height()))
             .flex_none()
             .pl(px(Metrics::TOOLBAR_EDGE_INSET))
             .pr(px(Metrics::TOOLBAR_EDGE_INSET + header_trailing_inset))
@@ -4530,6 +4567,9 @@ impl TerminalPane {
             .items_center()
             .justify_between()
             .bg(colors.work_surface_nested())
+            .when(self.island_corners, |header| {
+                header.rounded_t(px(Radius::CARD))
+            })
             .child(
                 div()
                     .min_w(px(0.0))
@@ -5492,6 +5532,7 @@ impl Render for TerminalPane {
                 .track_focus(&self.focus)
                 .size_full()
                 .bg(colors.terminal_surface())
+                .when(self.island_corners, |note| note.rounded(px(Radius::CARD)))
                 .child(pane)
                 .into_any_element();
         }
@@ -5537,8 +5578,11 @@ impl TerminalPane {
                 .flex_1()
                 .h_full()
                 .overflow_hidden()
-                .border_l_1()
-                .border_color(sidebar_colors.primary.alpha(0.08))
+                .when(!self.island_corners, |pane| {
+                    pane.border_l_1()
+                        .border_color(sidebar_colors.primary.alpha(0.08))
+                })
+                .when(self.island_corners, |pane| pane.rounded(px(Radius::CARD)))
                 .bg(colors.terminal_surface())
                 .when(!self.header_hidden, |pane| {
                     pane.child(self.render_header(&session, sidebar_colors, cx))
@@ -5549,10 +5593,15 @@ impl TerminalPane {
                 .flex_1()
                 .flex()
                 .flex_col()
-                .when(!self.header_hidden, |surface| {
+                .when(!self.header_hidden || self.island_corners, |surface| {
                     surface
                         .rounded_tl(px(Radius::CARD))
                         .rounded_tr(px(Radius::CARD))
+                })
+                .when(self.island_corners, |surface| {
+                    surface
+                        .rounded_bl(px(Radius::CARD))
+                        .rounded_br(px(Radius::CARD))
                 })
                 .overflow_hidden()
                 .bg(colors.work_surface_nested())
@@ -5590,10 +5639,11 @@ impl TerminalPane {
                 .flex()
                 .flex_col()
                 .bg(colors.terminal_surface())
+                .when(self.island_corners, |pane| pane.rounded(px(Radius::CARD)))
                 .when(has_header, |pane| {
                     pane.child(
                         div()
-                            .h(px(Metrics::TITLE_BAR))
+                            .h(px(self.title_bar_height()))
                             .flex_none()
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
                             .flex()
@@ -6330,6 +6380,12 @@ impl diri_ui::ScrollTarget for TerminalScrollTarget {
     fn bounce_edges(&self) -> (bool, bool) {
         (true, false)
     }
+}
+
+/// Title bar height of a comfortable-density island; see
+/// [`TerminalPane::title_bar_height`].
+pub(crate) fn island_title_bar() -> f32 {
+    Metrics::TITLE_BAR - 2.0 * crate::store::PaneDensity::Comfortable.island_gap()
 }
 
 #[cfg(test)]

@@ -132,6 +132,8 @@ enum SettingsMenu {
     MemoryLimit,
     FileEditor,
     UpdateChannel,
+    InterfaceStyle,
+    PaneDensity,
 }
 
 /// Update channels, in menu order.
@@ -826,28 +828,54 @@ impl UtilitySurfaces {
         this
     }
 
+    /// Settings stands where the terminal card does and paints like it: the
+    /// work surface under the interface style, and under comfortable density
+    /// a rounded island inset on the sidebar's material.
+    fn settings_island(&self, page: AnyElement) -> AnyElement {
+        let colors = self.colors();
+        let density = self.prefs.pane_density;
+        if !density.islands() {
+            return div()
+                .size_full()
+                .bg(colors.terminal_surface())
+                .child(page)
+                .into_any_element();
+        }
+        let radius = px(Radius::CARD);
+        div()
+            .size_full()
+            .p(px(density.island_gap()))
+            .bg(colors.sidebar_surface())
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .rounded(radius)
+                    .bg(colors.terminal_surface())
+                    .overflow_hidden()
+                    .child(page)
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.10)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The live palette, interface style and its palette preview included,
+    /// so Settings paints as part of the same window as the workbench.
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::colors_with(
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .preview_theme_id()
-                .unwrap_or(&self.prefs.terminal_theme),
-            self.prefs.window_material.to_ui(),
-        )
-        .with_transparency(self.prefs.window_transparency)
+        crate::app_theme::colors_in(&self.store.read().expect("session store lock poisoned"))
     }
 
     fn settings_colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors_with(
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .preview_theme_id()
-                .unwrap_or(&self.prefs.terminal_theme),
-            self.prefs.window_material.to_ui(),
+        crate::app_theme::sidebar_colors_in(
+            &self.store.read().expect("session store lock poisoned"),
         )
-        .with_transparency(self.prefs.window_transparency)
     }
 
     pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
@@ -3115,7 +3143,8 @@ impl UtilitySurfaces {
             .track_scroll(&self.settings_scroll)
             .size_full()
             .overflow_y_scroll()
-            .bg(colors.background)
+            // The settings island behind paints the surface, styled like
+            // the terminal card it stands in for.
             .child(
                 div()
                     .w_full()
@@ -3162,6 +3191,11 @@ impl UtilitySurfaces {
             .size_full()
             .pt(px(Metrics::TITLE_BAR))
             .overflow_hidden()
+            // In comfortable this fills a rounded island, and GPUI clips to
+            // rectangles, so the fill rounds itself.
+            .when(self.prefs.pane_density.islands(), |shell| {
+                shell.rounded(px(Radius::CARD))
+            })
             .bg(colors.work_surface())
             .flex()
             // Settings owns the workbench beside the sidebar. Clicking inside
@@ -4832,6 +4866,8 @@ impl UtilitySurfaces {
             SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
             SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
+            SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
+            SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
         })
     }
 
@@ -5111,6 +5147,89 @@ impl UtilitySurfaces {
                 move |this, cx| {
                     this.settings_menu = None;
                     this.update_prefs(move |prefs| prefs.hibernate_after_minutes = value);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn interface_style_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::InterfaceStyle);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                self.prefs.interface_style().title().to_owned(),
+                "interface-style-dropdown",
+                open,
+                SettingsMenu::InterfaceStyle,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn interface_style_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self.prefs.interface_style();
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::InterfaceStyle::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("interface-style-option-{index}"),
+                choice.title().to_owned(),
+                choice == current,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.set_interface_style(choice));
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn pane_density_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::PaneDensity);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                self.prefs.pane_density.title().to_owned(),
+                "pane-density-dropdown",
+                open,
+                SettingsMenu::PaneDensity,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn pane_density_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::PaneDensity::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("pane-density-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.pane_density,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.pane_density = choice);
                     cx.notify();
                 },
             ));
@@ -5614,12 +5733,14 @@ impl UtilitySurfaces {
                         ))
                         .child(appearance_divider(colors))
                         .child(appearance_setting_row(
-                            t("settings.appearance.glass_window"),
-                            window_material_switch(
-                                self.prefs.window_material == WindowMaterial::Glass,
-                                colors,
-                                cx,
-                            ),
+                            t("settings.appearance.interface_style"),
+                            self.interface_style_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            t("settings.appearance.density"),
+                            self.pane_density_dropdown(cx),
                             colors,
                         ))
                         .child(appearance_divider(colors))
@@ -6958,8 +7079,7 @@ impl Render for UtilitySurfaces {
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                        .bg(self.colors().background)
-                        .child(overlay),
+                        .child(self.settings_island(overlay)),
                 );
                 if self.usage_share.is_some() {
                     page.child(self.usage_share_overlay(window, cx))
@@ -8053,35 +8173,6 @@ fn appearance_setting_row(
 
 /// Blur the desktop behind the window, or paint it solid. Solid is cheaper
 /// for the compositor, so the choice stays one click away from the theme.
-fn window_material_switch(
-    enabled: bool,
-    colors: SemanticColors,
-    cx: &mut Context<UtilitySurfaces>,
-) -> impl IntoElement {
-    div()
-        .id("window-material")
-        .flex_none()
-        .w(px(30.0))
-        .h(px(18.0))
-        .p(px(2.0))
-        .rounded(px(9.0))
-        .bg(if enabled {
-            Ink::FRESH.alpha(0.72)
-        } else {
-            colors.primary.alpha(0.14)
-        })
-        .flex()
-        .justify_end()
-        .when(!enabled, |toggle| toggle.justify_start())
-        .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| {
-            let material = this.prefs.window_material.toggled();
-            this.update_prefs(move |prefs| prefs.window_material = material);
-            cx.notify();
-        }))
-        .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary))
-}
-
 /// Drag toward "less" for a denser tint, toward "more" for clearer glass. The
 /// shipped density sits on a tick; clicking the value label returns to it.
 fn window_transparency_slider(
@@ -10579,7 +10670,13 @@ mod tests {
             .debug_bounds("settings-shell")
             .expect("settings shell should render");
 
-        assert_eq!(shell, root);
+        // Comfortable insets the page by the island gap on every side.
+        let gap = px(crate::store::PaneDensity::default().island_gap());
+        assert_eq!(shell.origin, root.origin + gpui::point(gap, gap));
+        assert_eq!(
+            shell.size,
+            gpui::size(root.size.width - gap * 2.0, root.size.height - gap * 2.0)
+        );
     }
 
     #[gpui::test]
@@ -10937,10 +11034,13 @@ mod tests {
         assert_eq!(navigation.size.width, sidebar.size.width);
         assert_eq!(
             shell.left(),
-            sidebar.right(),
-            "the settings page should begin where the sidebar ends"
+            sidebar.right() + px(crate::store::PaneDensity::default().island_gap()),
+            "the settings page should begin where the sidebar ends, past the island gap"
         );
-        assert_eq!(shell.right(), px(1200.0));
+        assert_eq!(
+            shell.right(),
+            px(1200.0 - crate::store::PaneDensity::default().island_gap())
+        );
         assert!(cx.debug_bounds("SETTINGS_TAB_General").is_some());
         harness.read_with(cx, |harness, cx| {
             assert!(harness.sidebar.read(cx).shows_settings());
@@ -11062,7 +11162,7 @@ mod tests {
         );
         assert_eq!(
             shell.left(),
-            px(320.0),
+            px(320.0) + px(crate::store::PaneDensity::default().island_gap()),
             "the page stays against the sidebar as the seam is dragged"
         );
     }

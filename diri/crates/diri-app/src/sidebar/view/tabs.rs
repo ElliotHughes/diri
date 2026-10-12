@@ -1,6 +1,6 @@
 use super::*;
 use crate::store::TabOrientation;
-use crate::tab_navigation::{TAB_STRIP_HEIGHT, selected_project_tabs};
+use crate::tab_navigation::selected_project_tabs;
 use diri_ui::title_fade;
 
 pub(super) const TAB_WIDTH: f32 = 164.0;
@@ -176,6 +176,11 @@ impl StripMenu {
     }
 }
 
+/// Window x of the strip's first control when it shares the traffic
+/// lights' row: the lights end 74 pt in, and the control's glyph sits at
+/// its leading edge, so this leaves a clear 10 pt.
+const STRIP_FIRST_CONTROL_X: f32 = 84.0;
+
 impl Sidebar {
     /// Open a session or project context menu from the horizontal strip.
     pub(super) fn open_strip_menu(
@@ -298,6 +303,45 @@ impl Sidebar {
             .expect("store")
             .preferences()
             .tab_orientation
+    }
+
+    /// The horizontal strip's height in the current density.
+    pub fn tab_strip_height(&self) -> f32 {
+        let store = self.store.read().expect("store");
+        crate::tab_navigation::tab_strip_height(store.preferences().pane_density)
+    }
+
+    /// Comfortable density: panes are islands on the chrome.
+    pub fn islands(&self) -> bool {
+        let store = self.store.read().expect("store");
+        store.preferences().pane_density.islands()
+    }
+
+    /// Room before the strip's first control. With the panel hidden the
+    /// strip shares the traffic lights' row, and its first control sits just
+    /// past the lights, at the same window x in either density.
+    pub(super) fn strip_leading_inset(&self) -> f32 {
+        if cfg!(target_os = "macos") && !self.ui.visible {
+            let gap = self
+                .store
+                .read()
+                .expect("store")
+                .preferences()
+                .pane_density
+                .island_gap();
+            STRIP_FIRST_CONTROL_X - gap
+        } else {
+            10.0
+        }
+    }
+
+    /// The strip's height when it is on screen, else zero.
+    pub fn horizontal_tabs_height(&self) -> f32 {
+        if self.horizontal_tabs_visible() {
+            self.tab_strip_height()
+        } else {
+            0.0
+        }
     }
 
     pub fn horizontal_tabs_visible(&self) -> bool {
@@ -924,7 +968,7 @@ impl Sidebar {
             // selection made while they were away.
             self.tab_pill.forget();
             self.workspace_nav.available_width = available_width;
-            return self.workspace_strip(colors, cx);
+            return self.workspace_strip(colors, trailing, cx);
         }
         let rows = self.render_project_tab_rows(available_width, cx);
         let held_hint = self.strip_held_hint;
@@ -941,31 +985,40 @@ impl Sidebar {
             .role(Role::TabList)
             .aria_label(t("sidebar.tabs.project_sessions"))
             .flex_none()
-            .h(px(TAB_STRIP_HEIGHT))
+            .h(px(self.tab_strip_height()))
             .w_full()
             .flex()
             .items_center()
             .relative()
-            .py(px(6.0))
+            .pt(px(
+                6.0 + self.tab_strip_height() - crate::tab_navigation::TAB_STRIP_HEIGHT
+            ))
+            .pb(px(6.0))
             .gap(px(0.0))
-            .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                92.0
-            } else {
-                10.0
-            }))
+            .pl(px(self.strip_leading_inset()))
             .pr(px(10.0))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .h(px(1.0))
-                    .bg(colors.primary.alpha(0.07)),
-            )
-            .bg(colors.sidebar_surface())
+            // Comfortable: the island below is the edge, so no hairline.
+            .when(!self.islands(), |strip| {
+                strip.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .h(px(1.0))
+                        .bg(colors.primary.alpha(0.07)),
+                )
+            })
+            // Islands already paint this chrome; a second tint would darken it.
+            .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .text_color(colors.primary)
-            .child(self.project_control(colors, cx))
+            .child(
+                // A breath between the project control and the first tab.
+                div()
+                    .flex_none()
+                    .mr(px(diri_ui::Metrics::TOOLBAR_COMPACT_GAP + 2.0))
+                    .child(self.project_control(colors, cx)),
+            )
             .child(rows)
             .child(crate::held_hints::below(
                 div()
