@@ -6102,7 +6102,7 @@ fn ui_agent_kind(kind: &ProtoAgentKind) -> UiAgentKind {
         ProtoAgentKind::CURSOR_ID => UiAgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => UiAgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => UiAgentKind::Shell,
-        _ => UiAgentKind::Generic,
+        id => UiAgentKind::from_agent_id(id),
     }
 }
 
