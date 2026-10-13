@@ -212,6 +212,10 @@ enum HorizontalFocusAction {
 
 #[derive(Clone, Debug)]
 pub(crate) enum SidebarEvent {
+    /// Only explicit empty surfaces may begin a native window move.
+    WindowDragPressed {
+        titlebar: bool,
+    },
     WorkspaceActivated(Option<diri_proto::workspace::WorkspaceId>),
     WorkspaceTabActivated,
     /// Root-mounted header popup visibility changed; no sidebar layout change.
@@ -2140,6 +2144,14 @@ impl Sidebar {
             )
         };
         div()
+            .id("sidebar-titlebar")
+            .debug_selector(|| "sidebar-titlebar".into())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(SidebarEvent::WindowDragPressed { titlebar: true });
+                }),
+            )
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
             .flex()
@@ -2529,6 +2541,13 @@ impl Sidebar {
         ) && cx.has_active_drag();
         div()
             .id("sidebar-empty-space-drop-target")
+            .debug_selector(|| "sidebar-empty-space-drop-target".into())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(SidebarEvent::WindowDragPressed { titlebar: false });
+                }),
+            )
             .flex_1()
             .min_h(px(52.0))
             .rounded(px(Radius::ROW))
@@ -2588,6 +2607,13 @@ impl Sidebar {
     fn empty_state(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("sidebar-empty-state")
+            .debug_selector(|| "sidebar-empty-state".into())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(SidebarEvent::WindowDragPressed { titlebar: false });
+                }),
+            )
             .flex_1()
             .flex()
             .items_center()
@@ -8759,6 +8785,12 @@ impl Sidebar {
                     div()
                         .id("sidebar-filter-empty")
                         .debug_selector(|| "sidebar-filter-empty".into())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| {
+                                cx.emit(SidebarEvent::WindowDragPressed { titlebar: false });
+                            }),
+                        )
                         .flex_1()
                         .px(px(20.0))
                         .pt(px(18.0))

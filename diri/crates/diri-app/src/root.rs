@@ -245,6 +245,26 @@ fn advance_seam(slide: &mut Option<SeamSlide>, settled: f32, now: Instant, windo
 /// How long a pending Engine connection goes unannounced.
 const CONNECTING_NOTICE_GRACE: Duration = Duration::from_millis(1500);
 
+#[derive(Default)]
+struct WindowDrag {
+    // Some(false) is sidebar body chrome: draggable, but not a titlebar double-click.
+    titlebar: Option<bool>,
+}
+
+impl WindowDrag {
+    fn arm(&mut self, titlebar: bool) {
+        self.titlebar = cfg!(target_os = "macos").then_some(titlebar);
+    }
+
+    fn take_move(&mut self, pressed_button: Option<MouseButton>, active_drag: bool) -> bool {
+        self.titlebar.take().is_some() && pressed_button == Some(MouseButton::Left) && !active_drag
+    }
+
+    fn release(&mut self, click_count: usize) -> bool {
+        self.titlebar.take() == Some(true) && click_count == 2
+    }
+}
+
 pub struct RootView {
     spawn_owner: crate::store::SpawnOwner,
     window_store: crate::store::WindowStore,
@@ -273,10 +293,8 @@ pub struct RootView {
     browser: std::rc::Rc<std::cell::RefCell<NativeBrowser>>,
     services: Arc<AppServices>,
     focus: FocusHandle,
-    /// A press on otherwise-unhandled titlebar chrome. Button presses stop the
-    /// mouse-down before it bubbles here, so even a one-pixel move remains a
-    /// button click rather than becoming a window drag.
-    titlebar_drag_armed: bool,
+    /// Armed only by otherwise-unhandled titlebar chrome or explicit sidebar blanks.
+    window_drag: WindowDrag,
     resize_origin: Option<(f32, f32)>,
     /// The sidebar open/close currently being painted, if any.
     sidebar_slide: Option<SeamSlide>,
@@ -653,6 +671,11 @@ impl RootView {
         })
         .detach();
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::WindowDragPressed { titlebar } = event
+                && !cx.has_active_drag()
+            {
+                this.window_drag.arm(*titlebar);
+            }
             if let SidebarEvent::WorkspaceActivated(id) = event {
                 this.sidebar
                     .update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
@@ -1451,7 +1474,7 @@ impl RootView {
             browser,
             services,
             focus: cx.focus_handle(),
-            titlebar_drag_armed: false,
+            window_drag: WindowDrag::default(),
             resize_origin: None,
             sidebar_slide: None,
             sidebar_panel_slide: None,
@@ -5182,6 +5205,46 @@ impl Render for RootView {
                 )
             });
 
+        // Occluding panels can hide the root hitbox after a valid press. Track
+        // that gesture at window scope; only the explicit bubble targets arm it.
+        let drag_owner = cx.entity().downgrade();
+        let window_drag_tracking = gpui::canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                let owner = drag_owner.clone();
+                window.on_mouse_event(move |_: &gpui::MouseDownEvent, phase, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = owner.update(cx, |this, _| this.window_drag.titlebar = None);
+                    }
+                });
+                let owner = drag_owner.clone();
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = owner.update(cx, |this, cx| {
+                            if this
+                                .window_drag
+                                .take_move(event.pressed_button, cx.has_active_drag())
+                            {
+                                window.start_window_move();
+                            }
+                        });
+                    }
+                });
+                let owner = drag_owner.clone();
+                window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
+                    if phase == gpui::DispatchPhase::Capture && event.button == MouseButton::Left {
+                        let _ = owner.update(cx, |this, _| {
+                            if this.window_drag.release(event.click_count) {
+                                window.titlebar_double_click();
+                            }
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+
         let mut root = div()
             .id("root")
             .key_context(key_context)
@@ -5197,29 +5260,14 @@ impl Render for RootView {
             // Every panel keeps its own surface treatment above this base.
             .bg(colors.window_fill())
             .track_focus(&self.focus)
+            .child(window_drag_tracking)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
                     let pointer_y = f32::from(event.position.y);
-                    this.titlebar_drag_armed =
-                        cfg!(target_os = "macos") && (0.0..Metrics::TITLE_BAR).contains(&pointer_y);
-                }),
-            )
-            .on_mouse_move(
-                cx.listener(|this, event: &gpui::MouseMoveEvent, window, _| {
-                    if this.titlebar_drag_armed && event.pressed_button == Some(MouseButton::Left) {
-                        this.titlebar_drag_armed = false;
-                        window.start_window_move();
+                    if (0.0..Metrics::TITLE_BAR).contains(&pointer_y) {
+                        this.window_drag.arm(true);
                     }
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseUpEvent, window, _| {
-                    if this.titlebar_drag_armed && event.click_count == 2 {
-                        window.titlebar_double_click();
-                    }
-                    this.titlebar_drag_armed = false;
                 }),
             )
             .capture_key_down(cx.listener(Self::on_key_down))
@@ -11653,6 +11701,217 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_drag_is_one_shot_and_only_titlebar_double_clicks_zoom() {
+        for titlebar in [false, true] {
+            let mut drag = WindowDrag {
+                titlebar: Some(titlebar),
+            };
+            assert!(drag.take_move(Some(MouseButton::Left), false));
+            assert!(!drag.take_move(Some(MouseButton::Left), false));
+            for (button, active) in [
+                (None, false),
+                (Some(MouseButton::Right), false),
+                (Some(MouseButton::Left), true),
+            ] {
+                drag.titlebar = Some(titlebar);
+                assert!(!drag.take_move(button, active));
+                assert!(drag.titlebar.is_none());
+            }
+            drag.titlebar = Some(titlebar);
+            assert_eq!(drag.release(2), titlebar);
+            assert!(!drag.release(2));
+            drag.titlebar = Some(titlebar);
+            assert!(!drag.release(1));
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_empty_chrome_arms_window_drag(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Empty, window, cx)
+        });
+        root.update(cx, |root, cx| {
+            root.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx))
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+        for floating in [false, true] {
+            if floating {
+                root.update(cx, |root, cx| {
+                    root.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx))
+                });
+                cx.run_until_parked();
+                let edge = cx.debug_bounds("sidebar-peek-edge").unwrap();
+                cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+                cx.executor().advance_clock(Duration::from_millis(25));
+                cx.run_until_parked();
+                assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+            }
+            let bar = cx.debug_bounds("sidebar-titlebar").unwrap();
+            let body = cx.debug_bounds("sidebar-empty-state").unwrap();
+            for (position, titlebar) in [
+                (point(bar.left() + px(100.0), bar.center().y), true),
+                (body.center(), false),
+            ] {
+                cx.simulate_event(gpui::MouseDownEvent {
+                    position,
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                });
+                assert_eq!(
+                    root.read_with(cx, |root, _| root.window_drag.titlebar),
+                    cfg!(target_os = "macos").then_some(titlebar),
+                    "floating={floating}: explicit sidebar blank must receive the press"
+                );
+                // Release on an occluding button, without moving first: clearing
+                // must not depend on either the root or the start hitbox hovering.
+                let release = cx.debug_bounds("sidebar-layout").unwrap().center();
+                cx.simulate_event(gpui::MouseUpEvent {
+                    position: release,
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                });
+                assert!(root.read_with(cx, |root, _| root.window_drag.titlebar.is_none()));
+                cx.simulate_event(gpui::MouseDownEvent {
+                    position,
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Right,
+                    click_count: 1,
+                    first_mouse: false,
+                });
+                assert!(root.read_with(cx, |root, _| root.window_drag.titlebar.is_none()));
+                cx.simulate_event(gpui::MouseUpEvent {
+                    position,
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Right,
+                    click_count: 1,
+                });
+            }
+            for selector in ["sidebar-layout", "sidebar-search", "sidebar-toggle"] {
+                let position = cx.debug_bounds(selector).unwrap().center();
+                cx.simulate_event(gpui::MouseDownEvent {
+                    position,
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                });
+                assert!(
+                    root.read_with(cx, |root, _| root.window_drag.titlebar.is_none()),
+                    "{selector}"
+                );
+                cx.simulate_mouse_move(
+                    position + point(px(1.0), px(0.0)),
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                );
+                cx.simulate_event(gpui::MouseUpEvent {
+                    position: body.center(),
+                    modifiers: Modifiers::default(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_rows_and_resize_do_not_arm_window_drag(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        root.update(cx, |root, cx| {
+            root.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx))
+        });
+        cx.simulate_resize(size(px(1_000.0), px(900.0)));
+        cx.run_until_parked();
+        let row = cx.debug_bounds("SESSION_preview-claude").unwrap().center();
+        let surface = cx.debug_bounds("sidebar-surface").unwrap();
+        let edge = point(surface.right(), px(300.0));
+        for position in [row, edge] {
+            cx.simulate_event(gpui::MouseDownEvent {
+                position,
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            });
+            assert!(root.read_with(cx, |root, _| root.window_drag.titlebar.is_none()));
+            cx.simulate_mouse_move(
+                position + point(px(1.0), px(0.0)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                position + point(px(12.0), px(0.0)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            assert!(
+                cx.update(|_, cx| cx.has_active_drag()),
+                "existing row/resize drag must start"
+            );
+            assert!(root.read_with(cx, |root, _| root.window_drag.titlebar.is_none()));
+            cx.simulate_event(gpui::MouseUpEvent {
+                position,
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+            });
+            cx.run_until_parked();
+        }
+        let blank = cx
+            .debug_bounds("sidebar-empty-space-drop-target")
+            .unwrap()
+            .center();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: blank,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert_eq!(
+            root.read_with(cx, |root, _| root.window_drag.titlebar),
+            cfg!(target_os = "macos").then_some(false)
+        );
+        cx.simulate_mouse_move(row, None, Modifiers::default());
+        assert!(
+            root.read_with(cx, |root, _| root.window_drag.titlebar.is_none()),
+            "a lost release must not leave the gesture armed"
+        );
+        let filter = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter, Modifiers::default());
+        cx.simulate_keystrokes("x x x x");
+        let filtered = cx.debug_bounds("sidebar-filter-empty").unwrap().center();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: filtered,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        assert_eq!(
+            root.read_with(cx, |root, _| root.window_drag.titlebar),
+            cfg!(target_os = "macos").then_some(false)
+        );
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: filtered,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+        });
+        assert!(root.read_with(cx, |root, _| root.window_drag.titlebar.is_none()));
+    }
+
     #[gpui::test]
     fn titlebar_controls_do_not_arm_window_drag_but_empty_chrome_does(
         cx: &mut gpui::TestAppContext,
@@ -11692,7 +11951,7 @@ mod tests {
                 first_mouse: false,
             });
             assert!(
-                !root.read_with(cx, |root, _| root.titlebar_drag_armed),
+                !root.read_with(cx, |root, _| root.window_drag.titlebar.is_some()),
                 "{selector} must remain a click even if the pointer moves by a pixel"
             );
             cx.simulate_event(gpui::MouseUpEvent {
@@ -11722,7 +11981,7 @@ mod tests {
             first_mouse: false,
         });
         assert_eq!(
-            root.read_with(cx, |root, _| root.titlebar_drag_armed),
+            root.read_with(cx, |root, _| root.window_drag.titlebar.is_some()),
             cfg!(target_os = "macos"),
             "macOS arms window move on empty chrome; Linux leaves it to the compositor"
         );
