@@ -352,6 +352,10 @@ pub struct WorkbenchInspector {
     markdown_cache: HashMap<String, Arc<MarkdownDocument>>,
     focus: FocusHandle,
     visible: bool,
+    /// Comfortable density: the panel is a rounded island, and its title
+    /// bar shrinks by the gap above it so it stays on the traffic lights'
+    /// line.
+    island: bool,
     selected_tab: InspectorTab,
     details_tab: InspectorTab,
     workspace_session: Option<SessionId>,
@@ -505,6 +509,7 @@ impl WorkbenchInspector {
             markdown_cache: HashMap::new(),
             focus,
             visible: false,
+            island: false,
             selected_tab,
             details_tab: if selected_tab == InspectorTab::Artifacts {
                 InspectorTab::Artifacts
@@ -580,6 +585,23 @@ impl WorkbenchInspector {
         self.visible
     }
 
+    pub(crate) fn set_island(&mut self, island: bool, cx: &mut Context<Self>) {
+        if self.island != island {
+            self.island = island;
+            cx.notify();
+        }
+    }
+
+    /// The workspace header's height: the window title bar, less the island
+    /// gap above it in comfortable density.
+    fn header_height(&self) -> f32 {
+        if self.island {
+            crate::terminal_pane::island_title_bar()
+        } else {
+            Metrics::TITLE_BAR
+        }
+    }
+
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.sync_workspace_session(cx);
         if self.visible == visible {
@@ -587,7 +609,11 @@ impl WorkbenchInspector {
         }
         self.visible = visible;
         if visible {
+            // The panel slides in carrying its content, as the left sidebar
+            // does; a tab transition on top would fade and shift it mid-slide.
+            let transition = self.tab_transition_generation;
             self.seed_default_workspace(cx);
+            self.tab_transition_generation = transition;
             self.sync_workspace_follow(true, cx);
             // One-shot, every tab. Info renders the Git summary and the header
             // renders the Changes badge, so becoming visible always needs one
@@ -1001,6 +1027,17 @@ impl WorkbenchInspector {
             return;
         }
         self.save_active_workspace();
+        // Panes of one split tab share the panel's open/closed state, so
+        // moving focus between them does not open or close it.
+        let same_tab = {
+            let store = self.runtime.store.read().expect("store");
+            match (&self.workspace_session, &session) {
+                (Some(from), Some(to)) => store.pane_owner(from) == store.pane_owner(to),
+                _ => false,
+            }
+        };
+        let tab_visible = self.visible;
+        let transition = self.tab_transition_generation;
         let previous = SessionWorkspace {
             tabs: std::mem::take(&mut self.workspace_tabs),
             active: self.workspace_active.take(),
@@ -1023,7 +1060,7 @@ impl WorkbenchInspector {
         });
         self.workspace_tabs = next.tabs;
         self.next_terminal_slot = next.next_terminal_slot;
-        self.visible = next.visible;
+        self.visible = if same_tab { tab_visible } else { next.visible };
         self.workspace_selected = None;
         self.workspace_chooser_open = false;
         self.comparison_menu_open = false;
@@ -1059,6 +1096,11 @@ impl WorkbenchInspector {
             && let Some(surface) = self.load_workspace(id, cx)
         {
             cx.emit(InspectorEvent::WorkspaceRestored(surface));
+        }
+        if same_tab {
+            // Moving between panes of one tab swaps the panel's content in
+            // place; the tab-switch slide would read as the panel re-entering.
+            self.tab_transition_generation = transition;
         }
         if self.visible {
             self.seed_default_workspace(cx);
@@ -2347,7 +2389,7 @@ impl WorkbenchInspector {
     /// click anywhere else both dismiss it, so the menu never outlives the
     /// pointer leaving it.
     fn render_add_menu(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let top = Metrics::TITLE_BAR - 4.0;
+        let top = self.header_height() - 4.0;
         // Right-aligned under the + button, which sits just before the toggle.
         let right = Metrics::TOOLBAR_EDGE_INSET
             + Metrics::TOOLBAR_CONTROL_SIZE
@@ -2627,7 +2669,7 @@ impl WorkbenchInspector {
         div()
             .id("workspace-surface-header")
             .relative()
-            .h(px(Metrics::TITLE_BAR))
+            .h(px(self.header_height()))
             .flex_none()
             .pl(px(7.0))
             .pr(px(Metrics::TOOLBAR_EDGE_INSET))
@@ -3036,7 +3078,8 @@ impl WorkbenchInspector {
                 .into_any_element();
         };
 
-        let (project_name, host_name) = {
+        let kind = ui_agent_kind(session.effective_kind());
+        let (project_name, host_name, agent_name) = {
             let store = self
                 .runtime
                 .store
@@ -3051,9 +3094,18 @@ impl WorkbenchInspector {
                 .host
                 .as_deref()
                 .map(|host| store.host_display_name(host));
-            (project_name, host_name)
+            // The four brand kinds, terminals and notes keep their short
+            // label; any other Agent is called by its manifest or catalog name.
+            let agent_name = match kind {
+                AgentKind::Agent(_) | AgentKind::Generic => crate::notifications::display_name(
+                    session.effective_kind(),
+                    store.agent_descriptor(session.effective_kind()),
+                )
+                .to_owned(),
+                _ => kind.label().to_owned(),
+            };
+            (project_name, host_name, agent_name)
         };
-        let kind = ui_agent_kind(session.effective_kind());
         let (status_label, status_color) = session_status(session, colors);
         let artifact_total = artifact_count(session);
 
@@ -3100,7 +3152,7 @@ impl WorkbenchInspector {
                                     .child(status_label),
                             )
                             .child("·")
-                            .child(div().flex_none().child(kind.label()))
+                            .child(div().flex_none().child(agent_name))
                             .child("·")
                             .child(div().min_w(px(0.0)).truncate().child(project_name.clone())),
                     ),
@@ -6078,11 +6130,14 @@ impl Render for WorkbenchInspector {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::handle_key_down))
             .relative()
+            // GPUI clips to rectangles, so each fill rounds itself.
+            .when(self.island, |panel| panel.rounded(px(Radius::CARD)))
             .when(!hosted_terminal, |panel| panel.bg(background))
             .text_color(colors.primary)
             .child(
                 div()
                     .flex_none()
+                    .when(self.island, |header| header.rounded_t(px(Radius::CARD)))
                     .when(hosted_terminal, |header| header.bg(background))
                     .child(self.render_workspace_header(colors, held_hint, cx)),
             )
@@ -6255,7 +6310,7 @@ fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
         ProtoAgentKind::CURSOR_ID => AgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => AgentKind::Shell,
-        _ => AgentKind::Generic,
+        id => AgentKind::from_agent_id(id),
     }
 }
 

@@ -54,6 +54,10 @@ impl Method {
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
+    /// One chunk of an inline image a terminal placed. A remote session's is
+    /// read from its Holder (`inline-images-v1`) in smaller chunks; unknown
+    /// keys, evicted images and older Holders answer `image_not_found`.
+    pub const SESSION_READ_IMAGE: &'static str = "session.read_image";
     pub const SESSION_READ_TRANSCRIPT: &'static str = "session.read_transcript";
     pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";
     /// Returns a completed turn to "done · unseen", like marking a chat
@@ -92,6 +96,7 @@ impl Method {
     pub const PROJECT_ADD: &'static str = "project.add";
     pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
+    pub const TERMINAL_CONFIGURE: &'static str = "terminal.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
     pub const AGENT_CONFIGURE: &'static str = "agent.configure";
     pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
@@ -102,6 +107,9 @@ impl Method {
     pub const ACCOUNT_CLAUDE_LOGIN: &'static str = "account.claude.login";
     pub const ACCOUNT_CLAUDE_CAPTURE: &'static str = "account.claude.capture";
     pub const ACCOUNT_SWITCH_ALL: &'static str = "account.switch_all";
+    pub const ACCOUNT_OVERVIEW: &'static str = "account.overview";
+    pub const ACCOUNT_ADOPT: &'static str = "account.adopt";
+    pub const ACCOUNT_ADD: &'static str = "account.add";
     pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
@@ -365,6 +373,9 @@ pub struct AgentReadinessItem {
     pub path_source: Option<AgentPathSource>,
     #[serde(default = "default_true")]
     pub show_in_quick_create: bool,
+    /// User-configured arguments appended to every launch on this target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// The agent's manifest descriptor. This is how the AGENT CATALOG reaches
@@ -462,6 +473,12 @@ pub struct AgentConfigureParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
     pub show_in_quick_create: bool,
+    /// Extra arguments for every launch of this Agent on this target, e.g.
+    /// `--dangerously-skip-permissions`. Absent keeps the stored arguments,
+    /// so clients that only edit the path never clear them; an empty list
+    /// clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_args: Option<Vec<String>>,
 }
 
 pub type AgentConfigureResult = AgentReadinessResult;
@@ -517,6 +534,12 @@ pub struct SessionSpawnParams {
     /// leaves that question to the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<TerminalAppearance>,
+    /// What a binary-free kind (a `shell` terminal) runs instead of the login
+    /// shell: one structured argv, exec'd directly in the PTY, never joined
+    /// into a shell command. The Engine validates it before any side effect.
+    /// Absent keeps the manifest's launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
 }
 
 /// The light or dark family of the terminal theme a Session is shown in.
@@ -1270,6 +1293,19 @@ pub struct HookReportParams {
 pub type HookReportResult = EmptyResult;
 pub type GovernorConfigureParams = GovernorSettingsParams;
 pub type GovernorConfigureResult = EmptyResult;
+
+/// Engine-side terminal settings the app owns. The Engine keeps the last
+/// value it was sent, so terminals it restarts before the app connects follow
+/// it too.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalConfigureParams {
+    /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
+    /// command marks without any setup.
+    pub shell_integration: bool,
+}
+
+pub type TerminalConfigureResult = EmptyResult;
 pub type ClientSetActiveResult = EmptyResult;
 pub type DaemonPrepareShutdownParams = EmptyParams;
 pub type DaemonPrepareShutdownResult = EmptyResult;
@@ -1297,6 +1333,33 @@ pub struct ForwardRequest {
     pub forward: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// The key of an [`crate::inline_image::ImageAnchor`].
+    pub key: String,
+    #[serde(default)]
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageResult {
+    pub format: crate::inline_image::InlineImageFormat,
+    /// Raw formats are zlib-compressed (Kitty `o=z`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Length of the whole stored image; read on while `offset + data` is short.
+    pub total: u64,
+    pub offset: u64,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1350,7 +1413,7 @@ mod base64_bytes {
             return Err("base64 length must be a multiple of four");
         }
         let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             let last = index + 1 == bytes.len() / 4;
             let a = value(chunk[0]).ok_or("invalid base64 character")?;
             let b = value(chunk[1]).ok_or("invalid base64 character")?;

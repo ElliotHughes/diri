@@ -21,7 +21,9 @@ use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, LocalEdit, QueryEditor};
 use crate::quick_open;
-use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
+use crate::settings::{
+    HostDraft, SettingsNav, SettingsTab, ThemeGroup, ThemePickerRow, theme, theme_picker_rows,
+};
 mod account_settings;
 mod import_settings;
 mod privacy_settings;
@@ -39,8 +41,9 @@ use diri_ui::{
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
     DragMoveEvent, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, SharedString, Task,
-    TextRun, Window, canvas, deferred, div, ease_out_quint, font, point, prelude::*, px, rgba,
+    MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, ScrollStrategy,
+    SharedString, Task, TextRun, UniformListScrollHandle, Window, canvas, deferred, div,
+    ease_out_quint, font, point, prelude::*, px, rgba, uniform_list,
 };
 use tokio::runtime::Runtime;
 
@@ -129,6 +132,8 @@ enum SettingsMenu {
     MemoryLimit,
     FileEditor,
     UpdateChannel,
+    InterfaceStyle,
+    PaneDensity,
 }
 
 /// Update channels, in menu order.
@@ -274,9 +279,55 @@ struct HostEditor {
 struct AgentPathEditor {
     kind: ProtoAgentKind,
     host: Option<String>,
+    /// What `path` edits: the remote executable path, or the launch arguments.
+    field: AgentEditorField,
+    /// The executable path saved alongside a launch-arguments edit, so the
+    /// row's binding is unchanged.
+    configured_path: Option<String>,
     path: QueryEditor,
     show_in_quick_create: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentEditorField {
+    Path,
+    Arguments,
+}
+
+/// One line for an import that failed: which file, and why in words the
+/// person can act on.
+fn theme_import_failure(path: &Path, error: &crate::imported_themes::ImportError) -> String {
+    use crate::imported_themes::ImportError;
+    use diri_term::theme_file::ThemeFileError;
+    let reason = match error {
+        ImportError::Read => "settings.appearance.theme_error_read",
+        ImportError::Write => "settings.appearance.theme_error_write",
+        ImportError::Parse(ThemeFileError::TooLarge) => "settings.appearance.theme_error_too_large",
+        ImportError::Parse(ThemeFileError::UnsupportedVersion(_)) => {
+            "settings.appearance.theme_error_newer"
+        }
+        ImportError::Parse(ThemeFileError::Missing(_)) => "settings.appearance.theme_error_missing",
+        ImportError::Parse(ThemeFileError::NotText | ThemeFileError::Invalid(_)) => {
+            "settings.appearance.theme_error_format"
+        }
+    };
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    tf(
+        "settings.appearance.theme_import_failed",
+        &[("file", &file), ("reason", &t(reason))],
+    )
+}
+
+/// What the last theme import or export did.
+#[derive(Clone, Debug, PartialEq)]
+enum ThemeFileStatus {
+    Imported(usize),
+    Exported(String),
+    Failed(String),
 }
 
 struct ShortcutEditor {
@@ -435,6 +486,8 @@ impl HostEditor {
 
 pub(crate) enum UtilitySurfacesEvent {
     AccountLoginOpened,
+    /// Ask every account for its plan limits again.
+    RefreshUsageLimits,
     /// A What's New thumbnail was clicked: open the sheet on that highlight.
     ShowWhatsNew(usize),
 }
@@ -497,6 +550,11 @@ pub struct UtilitySurfaces {
     shortcut_search: QueryEditor,
     shortcut_search_active: bool,
     shortcut_editor: Option<ShortcutEditor>,
+    /// The open theme menu's search; typing goes here while it is open.
+    theme_search: QueryEditor,
+    theme_scroll: UniformListScrollHandle,
+    /// The last theme import or export, shown beside its buttons.
+    theme_file_status: Option<ThemeFileStatus>,
     include_path: PathBuf,
     include_editor: QueryEditor,
     include_editor_active: bool,
@@ -527,6 +585,12 @@ pub struct UtilitySurfaces {
     /// an XPC round trip to launchd that has taken seconds, so it never runs
     /// on the UI thread; the toggle ignores clicks until it lands.
     login_item_task: Option<Task<()>>,
+    default_terminal: crate::default_terminal::DefaultTerminal,
+    /// Whether Launch Services sends `ssh://` links and `.command` files to
+    /// diri, as last read when Settings opened.
+    default_terminal_state: crate::default_terminal::DefaultTerminalState,
+    /// A Launch Services read or change in flight off the UI thread.
+    default_terminal_task: Option<Task<()>>,
     store: crate::store::WindowStore,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
@@ -724,6 +788,9 @@ impl UtilitySurfaces {
             shortcut_search: QueryEditor::default(),
             shortcut_search_active: false,
             shortcut_editor: None,
+            theme_search: QueryEditor::default(),
+            theme_scroll: UniformListScrollHandle::new(),
+            theme_file_status: None,
             include_path,
             include_editor,
             include_editor_active: false,
@@ -750,6 +817,9 @@ impl UtilitySurfaces {
             prefs,
             login_item,
             login_item_task: None,
+            default_terminal: crate::default_terminal::DefaultTerminal::system(),
+            default_terminal_state: crate::default_terminal::DefaultTerminalState::UNKNOWN,
+            default_terminal_task: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&store_runtime.store)),
             store_runtime,
             runtime,
@@ -769,28 +839,54 @@ impl UtilitySurfaces {
         this
     }
 
+    /// Settings stands where the terminal card does and paints like it: the
+    /// work surface under the interface style, and under comfortable density
+    /// a rounded island inset on the sidebar's material.
+    fn settings_island(&self, page: AnyElement) -> AnyElement {
+        let colors = self.colors();
+        let density = self.prefs.pane_density;
+        if !density.islands() {
+            return div()
+                .size_full()
+                .bg(colors.terminal_surface())
+                .child(page)
+                .into_any_element();
+        }
+        let radius = px(Radius::CARD);
+        div()
+            .size_full()
+            .p(px(density.island_gap()))
+            .bg(colors.sidebar_surface())
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .rounded(radius)
+                    .bg(colors.terminal_surface())
+                    .overflow_hidden()
+                    .child(page)
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.10)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The live palette, interface style and its palette preview included,
+    /// so Settings paints as part of the same window as the workbench.
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::colors_with(
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .preview_theme_id()
-                .unwrap_or(&self.prefs.terminal_theme),
-            self.prefs.window_material.to_ui(),
-        )
-        .with_transparency(self.prefs.window_transparency)
+        crate::app_theme::colors_in(&self.store.read().expect("session store lock poisoned"))
     }
 
     fn settings_colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors_with(
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .preview_theme_id()
-                .unwrap_or(&self.prefs.terminal_theme),
-            self.prefs.window_material.to_ui(),
+        crate::app_theme::sidebar_colors_in(
+            &self.store.read().expect("session store lock poisoned"),
         )
-        .with_transparency(self.prefs.window_transparency)
     }
 
     pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
@@ -1046,6 +1142,38 @@ impl UtilitySurfaces {
             let _ = this.update(cx, |this, cx| {
                 this.login_item_task = None;
                 this.apply_login_item_state(state);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Reads which app opens `ssh://` links and `.command` files, off the UI
+    /// thread. Reading never changes anything.
+    fn refresh_default_terminal(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.default_terminal.clone();
+        self.run_default_terminal(cx, move || terminal.observe());
+    }
+
+    /// The Settings button, and the only caller that changes the default.
+    fn make_default_terminal(&mut self, cx: &mut Context<Self>) {
+        if !self.default_terminal_state.can_make_default() || self.default_terminal_task.is_some() {
+            return;
+        }
+        let terminal = self.default_terminal.clone();
+        self.run_default_terminal(cx, move || terminal.make_default());
+    }
+
+    fn run_default_terminal(
+        &mut self,
+        cx: &mut Context<Self>,
+        call: impl FnOnce() -> crate::default_terminal::DefaultTerminalState + Send + 'static,
+    ) {
+        let answer = cx.background_executor().spawn(async move { call() });
+        self.default_terminal_task = Some(cx.spawn(async move |this, cx| {
+            let state = answer.await;
+            let _ = this.update(cx, |this, cx| {
+                this.default_terminal_task = None;
+                this.default_terminal_state = state;
                 cx.notify();
             });
         }));
@@ -1606,26 +1734,7 @@ impl UtilitySurfaces {
                 cx.notify();
             }
             "enter" => {
-                let Some(editor) = &self.agent_path_editor else {
-                    return true;
-                };
-                let path = editor.path.text().trim();
-                if path.is_empty() {
-                    if let Some(editor) = &mut self.agent_path_editor {
-                        editor.error = Some(t("settings.agents.path_required").into());
-                    }
-                } else {
-                    self.store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .configure_agent(diri_proto::AgentConfigureParams {
-                            host: editor.host.clone(),
-                            kind: editor.kind.clone(),
-                            executable_path: Some(path.to_owned()),
-                            show_in_quick_create: editor.show_in_quick_create,
-                        });
-                    self.agent_path_editor = None;
-                }
+                self.save_agent_editor();
                 cx.notify();
             }
             _ => {
@@ -1813,6 +1922,7 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         self.refresh_login_item(cx);
+        self.refresh_default_terminal(cx);
         self.surface = Surface::Settings;
         self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         self.settings_search.clear();
@@ -2179,6 +2289,219 @@ impl UtilitySurfaces {
         true
     }
 
+    /// Typing while the theme menu is open filters it; Return picks the
+    /// first match and Escape closes the menu.
+    fn handle_theme_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_menu != Some(SettingsMenu::TerminalTheme)
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.theme_search.is_empty() {
+                    self.settings_menu = None;
+                } else {
+                    self.theme_search.clear();
+                }
+            }
+            "enter" => {
+                let first = theme_picker_rows(self.theme_search.text())
+                    .into_iter()
+                    .find_map(|row| match row {
+                        ThemePickerRow::Theme(theme) => Some(theme.id),
+                        ThemePickerRow::Header(_) => None,
+                    });
+                if let Some(id) = first {
+                    self.choose_terminal_theme(id);
+                }
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.theme_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.theme_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.theme_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.theme_search.insert(&text);
+                        }
+                    }
+                }
+                self.theme_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn choose_terminal_theme(&mut self, id: &'static str) {
+        self.settings_menu = None;
+        self.update_prefs(move |prefs| {
+            prefs.follow_system_theme = false;
+            prefs.terminal_theme = id.to_owned();
+        });
+    }
+
+    /// Opens the theme menu at the selected theme with an empty search.
+    fn open_terminal_theme_menu(&mut self) {
+        self.theme_search.clear();
+        let selected = self.prefs.terminal_theme.clone();
+        if let Some(index) = theme_picker_rows("")
+            .iter()
+            .position(|row| matches!(row, ThemePickerRow::Theme(theme) if theme.id == selected))
+        {
+            self.theme_scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
+    }
+
+    fn import_terminal_themes(&mut self, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(t("settings.appearance.theme_import_prompt").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let dir = crate::imported_themes::default_dir();
+            let results = cx
+                .background_spawn(async move {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            (
+                                path.clone(),
+                                crate::imported_themes::import_path(&dir, path),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let mut imported = Vec::new();
+                let mut failed = None;
+                for (path, result) in results {
+                    match result {
+                        Ok(theme) => imported.push(theme),
+                        Err(error) => {
+                            failed.get_or_insert_with(|| theme_import_failure(&path, &error));
+                        }
+                    }
+                }
+                // The last good import becomes the theme, as choosing it would.
+                if let Some(theme) = imported.last() {
+                    this.choose_terminal_theme(theme.id);
+                }
+                this.theme_file_status = Some(match failed {
+                    Some(message) => ThemeFileStatus::Failed(message),
+                    None => ThemeFileStatus::Imported(imported.len()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn export_terminal_theme(&mut self, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        let current = theme(&self.prefs.terminal_theme);
+        let text = diri_term::theme_file::export_diri(&current);
+        let directory = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Downloads"))
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let path = cx.prompt_for_new_path(
+            &directory,
+            Some(&crate::imported_themes::export_file_name(&current)),
+        );
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = path.await else {
+                return;
+            };
+            let status = match std::fs::write(&path, text) {
+                Ok(()) => ThemeFileStatus::Exported(
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+                Err(_) => ThemeFileStatus::Failed(tf(
+                    "settings.appearance.theme_export_failed",
+                    &[("file", &path.display().to_string())],
+                )),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.theme_file_status = Some(status);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn theme_files_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let status = self.theme_file_status.as_ref().map(|status| match status {
+            ThemeFileStatus::Imported(count) => (
+                tf(
+                    "settings.appearance.theme_imported",
+                    &[("count", &count.to_string())],
+                ),
+                colors.secondary,
+            ),
+            ThemeFileStatus::Exported(file) => (
+                tf("settings.appearance.theme_exported", &[("file", file)]),
+                colors.secondary,
+            ),
+            ThemeFileStatus::Failed(message) => (message.clone(), Ink::DANGER),
+        });
+        div()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .when_some(status, |row, (text, color)| {
+                row.child(
+                    div()
+                        .debug_selector(|| "theme-file-status".into())
+                        .min_w(px(0.0))
+                        .max_w(px(260.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(11.0))
+                        .text_color(color)
+                        .child(text),
+                )
+            })
+            .child(surface_button(
+                t("settings.appearance.theme_import"),
+                "import-terminal-theme",
+                colors,
+                cx,
+                |this, cx| this.import_terminal_themes(cx),
+            ))
+            .child(surface_button(
+                t("settings.appearance.theme_export"),
+                "export-terminal-theme",
+                colors,
+                cx,
+                |this, cx| this.export_terminal_theme(cx),
+            ))
+            .into_any_element()
+    }
+
     fn handle_shortcut_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::Shortcuts
@@ -2309,7 +2632,7 @@ impl UtilitySurfaces {
         {
             return;
         }
-        if self.handle_settings_search_key(event, cx) {
+        if self.handle_theme_search_key(event, cx) || self.handle_settings_search_key(event, cx) {
             cx.stop_propagation();
             return;
         }
@@ -2812,7 +3135,8 @@ impl UtilitySurfaces {
             .track_scroll(&self.settings_scroll)
             .size_full()
             .overflow_y_scroll()
-            .bg(colors.background)
+            // The settings island behind paints the surface, styled like
+            // the terminal card it stands in for.
             .child(
                 div()
                     .w_full()
@@ -2859,6 +3183,11 @@ impl UtilitySurfaces {
             .size_full()
             .pt(px(Metrics::TITLE_BAR))
             .overflow_hidden()
+            // In comfortable this fills a rounded island, and GPUI clips to
+            // rectangles, so the fill rounds itself.
+            .when(self.prefs.pane_density.islands(), |shell| {
+                shell.rounded(px(Radius::CARD))
+            })
             .bg(colors.work_surface())
             .flex()
             // Settings owns the workbench beside the sidebar. Clicking inside
@@ -4193,6 +4522,7 @@ impl UtilitySurfaces {
                                 kind: toggle_kind.clone(),
                                 executable_path: toggle_path.clone(),
                                 show_in_quick_create: !show,
+                                launch_args: None,
                             });
                         cx.notify();
                     }))
@@ -4278,6 +4608,41 @@ impl UtilitySurfaces {
                     ),
             );
         }
+        let args_kind = item.kind.clone();
+        let args_host = self.agents_host.clone();
+        let args_path = item.configured_path.clone();
+        let args_text = crate::agent_catalog::join_launch_args(&item.launch_args);
+        let args_show = item.show_in_quick_create;
+        actions = actions.child(
+            div()
+                .id(format!("agent-args-{index}"))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(colors.primary.alpha(0.06))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.agent_path_editor = Some(AgentPathEditor {
+                        kind: args_kind.clone(),
+                        host: args_host.clone(),
+                        field: AgentEditorField::Arguments,
+                        configured_path: args_path.clone(),
+                        path: text_editor(&args_text),
+                        show_in_quick_create: args_show,
+                        error: None,
+                    });
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child(t("settings.agents.args")),
+                ),
+        );
         let edit_kind = item.kind.clone();
         let edit_path = item.configured_path.clone().unwrap_or_default();
         let edit_host = self.agents_host.clone();
@@ -4316,6 +4681,7 @@ impl UtilitySurfaces {
                                         kind: kind.clone(),
                                         executable_path: Some(path.to_string_lossy().into_owned()),
                                         show_in_quick_create: edit_show,
+                                        launch_args: None,
                                     });
                                 cx.notify();
                             });
@@ -4325,6 +4691,8 @@ impl UtilitySurfaces {
                         this.agent_path_editor = Some(AgentPathEditor {
                             kind: edit_kind.clone(),
                             host: edit_host.clone(),
+                            field: AgentEditorField::Path,
+                            configured_path: None,
                             path: text_editor(&edit_path),
                             show_in_quick_create: edit_show,
                             error: None,
@@ -4368,6 +4736,7 @@ impl UtilitySurfaces {
                                 kind: reset_kind.clone(),
                                 executable_path: None,
                                 show_in_quick_create: reset_show,
+                                launch_args: None,
                             });
                         cx.notify();
                     }))
@@ -4417,11 +4786,55 @@ impl UtilitySurfaces {
                             } else {
                                 colors.tertiary
                             })
-                            .child(item.error.unwrap_or(path)),
+                            .child(item.error.unwrap_or_else(|| {
+                                if item.launch_args.is_empty() {
+                                    path
+                                } else {
+                                    format!(
+                                        "{path} {}",
+                                        crate::agent_catalog::join_launch_args(&item.launch_args)
+                                    )
+                                }
+                            })),
                     ),
             )
             .child(actions)
             .into_any_element()
+    }
+
+    /// Saves the open path or arguments editor, or leaves it open with the
+    /// reason it cannot be saved.
+    fn save_agent_editor(&mut self) {
+        let Some(editor) = &mut self.agent_path_editor else {
+            return;
+        };
+        let text = editor.path.text().trim().to_owned();
+        let (executable_path, launch_args) = match editor.field {
+            AgentEditorField::Path if text.is_empty() => {
+                editor.error = Some(t("settings.agents.path_required").into());
+                return;
+            }
+            AgentEditorField::Path => (Some(text), None),
+            AgentEditorField::Arguments => {
+                let Some(mut args) = crate::agent_catalog::split_launch_args(&text) else {
+                    editor.error = Some(t("settings.agents.args_unbalanced").into());
+                    return;
+                };
+                args.retain(|arg| !arg.is_empty());
+                (editor.configured_path.clone(), Some(args))
+            }
+        };
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .configure_agent(diri_proto::AgentConfigureParams {
+                host: editor.host.clone(),
+                kind: editor.kind.clone(),
+                executable_path,
+                show_in_quick_create: editor.show_in_quick_create,
+                launch_args,
+            });
+        self.agent_path_editor = None;
     }
 
     fn agent_path_editor_row(
@@ -4442,7 +4855,10 @@ impl UtilitySurfaces {
                 div()
                     .text_size(px(10.0))
                     .text_color(colors.secondary)
-                    .child(t("settings.agents.remote_path_label")),
+                    .child(match editor.field {
+                        AgentEditorField::Path => t("settings.agents.remote_path_label"),
+                        AgentEditorField::Arguments => t("settings.agents.args_label"),
+                    }),
             )
             .child(
                 div()
@@ -4481,32 +4897,15 @@ impl UtilitySurfaces {
                     },
                 ))
                 .child(surface_button(
-                    t("settings.agents.save_path"),
+                    match editor.field {
+                        AgentEditorField::Path => t("settings.agents.save_path"),
+                        AgentEditorField::Arguments => t("settings.agents.save_args"),
+                    },
                     "save-agent-path",
                     colors,
                     cx,
                     |this, cx| {
-                        let Some(editor) = &this.agent_path_editor else {
-                            return;
-                        };
-                        let path = editor.path.text().trim();
-                        if path.is_empty() {
-                            if let Some(editor) = &mut this.agent_path_editor {
-                                editor.error = Some(t("settings.agents.path_required").into());
-                            }
-                            cx.notify();
-                            return;
-                        }
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .configure_agent(diri_proto::AgentConfigureParams {
-                                host: editor.host.clone(),
-                                kind: editor.kind.clone(),
-                                executable_path: Some(path.to_owned()),
-                                show_in_quick_create: editor.show_in_quick_create,
-                            });
-                        this.agent_path_editor = None;
+                        this.save_agent_editor();
                         cx.notify();
                     },
                 )),
@@ -4529,6 +4928,8 @@ impl UtilitySurfaces {
             SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
             SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
+            SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
+            SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
         })
     }
 
@@ -4622,92 +5023,177 @@ impl UtilitySurfaces {
         options.into_any_element()
     }
 
+    /// Every theme, searchable, grouped imported/dark/light. The list is
+    /// virtual: only visible rows are built, so hundreds of themes cost what
+    /// a dozen did.
     fn terminal_theme_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let selected = theme(&self.prefs.terminal_theme);
-        let mut options = div()
-            .id("terminal-theme-options")
-            .max_h(px(300.0))
-            .overflow_y_scroll()
-            .p(px(4.0))
+        let selected = theme(&self.prefs.terminal_theme).id;
+        let rows = Rc::new(theme_picker_rows(self.theme_search.text()));
+        let search_content = if self.theme_search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child(t("settings.appearance.theme_search_placeholder"))
+                .into_any_element()
+        } else {
+            query_label(&self.theme_search)
+        };
+        let search = div()
+            .debug_selector(|| "terminal-theme-search".into())
+            .h(px(30.0))
+            .mx(px(4.0))
+            .mt(px(4.0))
+            .px(px(8.0))
             .flex()
-            .flex_col();
-        for appearance in ThemeAppearance::ALL {
-            options = options.child(
+            .items_center()
+            .gap(px(7.0))
+            .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+            .bg(colors.primary.alpha(0.05))
+            .child(sf_symbol("magnifyingglass", 11.0, colors.tertiary))
+            .child(
                 div()
-                    .h(px(24.0))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(Typo::ROW.size))
+                    .text_color(colors.primary)
+                    .child(search_content),
+            );
+        let list = if rows.is_empty() {
+            div()
+                .h(px(64.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.secondary)
+                .child(t("settings.appearance.theme_no_match"))
+                .into_any_element()
+        } else {
+            let entity = cx.entity();
+            let height = (rows.len() as f32 * Metrics::ROW_HEIGHT).min(320.0) + 8.0;
+            div()
+                .h(px(height))
+                .child(
+                    uniform_list("terminal-theme-options", rows.len(), move |range, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            range
+                                .map(|index| {
+                                    this.terminal_theme_row(
+                                        rows[index],
+                                        index,
+                                        selected,
+                                        colors,
+                                        cx,
+                                    )
+                                })
+                                .collect()
+                        })
+                    })
+                    .track_scroll(&self.theme_scroll)
+                    .p(px(4.0))
+                    .size_full(),
+                )
+                .into_any_element()
+        };
+        div()
+            .debug_selector(|| "terminal-theme-menu".into())
+            .flex()
+            .flex_col()
+            .child(search)
+            .child(list)
+            .into_any_element()
+    }
+
+    fn terminal_theme_row(
+        &mut self,
+        row: ThemePickerRow,
+        index: usize,
+        selected: &'static str,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let candidate = match row {
+            ThemePickerRow::Header(group) => {
+                return div()
+                    .w_full()
+                    .h(px(Metrics::ROW_HEIGHT))
                     .px(px(8.0))
                     .flex()
-                    .items_center()
+                    .items_end()
+                    .pb(px(4.0))
                     .text_size(px(Typo::META.size - 1.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(colors.tertiary)
-                    .child(t(match appearance {
-                        ThemeAppearance::Light => "settings.appearance.group_light",
-                        ThemeAppearance::Dark => "settings.appearance.group_dark",
-                    })),
-            );
-            for (index, candidate) in TermTheme::CATALOG
-                .into_iter()
-                .enumerate()
-                .filter(|(_, theme)| theme.appearance == appearance)
-            {
-                let is_selected = candidate.id == selected.id;
-                options = options.child(
-                    div()
-                        .id(SharedString::from(format!("terminal-theme-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
-                        .px(px(8.0))
-                        .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .bg(Fill::selected(colors, is_selected))
-                        .cursor_pointer()
-                        .glass_menu_row(colors, false)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.settings_menu = None;
-                            this.update_prefs(move |prefs| {
-                                prefs.follow_system_theme = false;
-                                prefs.terminal_theme = candidate.id.to_owned();
-                            });
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .size(px(16.0))
-                                .rounded(px(5.0))
-                                .bg(candidate.background)
-                                .border_1()
-                                .border_color(colors.primary.alpha(0.16))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .size(px(5.0))
-                                        .rounded(px(2.5))
-                                        .bg(candidate.foreground),
-                                ),
-                        )
-                        .child(
-                            div().flex().gap(px(2.0)).children(
-                                [candidate.ansi[2], candidate.ansi[4], candidate.ansi[5]]
-                                    .map(|color| div().size(px(5.0)).rounded(px(2.5)).bg(color)),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(Typo::ROW.size))
-                                .child(candidate.name),
-                        )
-                        .when(is_selected, |row| {
-                            row.child(sf_symbol("checkmark", 10.0, colors.secondary))
-                        }),
-                );
+                    .child(t(match group {
+                        ThemeGroup::Imported => "settings.appearance.group_imported",
+                        ThemeGroup::Light => "settings.appearance.group_light",
+                        ThemeGroup::Dark => "settings.appearance.group_dark",
+                    }))
+                    .into_any_element();
             }
-        }
-        options.into_any_element()
+            ThemePickerRow::Theme(theme) => theme,
+        };
+        let is_selected = candidate.id == selected;
+        div()
+            .id(SharedString::from(format!("terminal-theme-option-{index}")))
+            .w_full()
+            .h(px(Metrics::ROW_HEIGHT))
+            .px(px(8.0))
+            .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .bg(Fill::selected(colors, is_selected))
+            .cursor_pointer()
+            .glass_menu_row(colors, false)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.choose_terminal_theme(candidate.id);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(16.0))
+                    .rounded(px(5.0))
+                    .bg(candidate.background)
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.16))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(5.0))
+                            .rounded(px(2.5))
+                            .bg(candidate.foreground),
+                    ),
+            )
+            .child(
+                div().flex_none().flex().gap(px(2.0)).children(
+                    [
+                        candidate.ansi[1],
+                        candidate.ansi[2],
+                        candidate.ansi[4],
+                        candidate.ansi[5],
+                    ]
+                    .map(|color| div().size(px(5.0)).rounded(px(2.5)).bg(color)),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(candidate.name),
+            )
+            .when(is_selected, |row| {
+                row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+            })
+            .into_any_element()
     }
 
     fn hibernate_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -4723,6 +5209,89 @@ impl UtilitySurfaces {
                 move |this, cx| {
                     this.settings_menu = None;
                     this.update_prefs(move |prefs| prefs.hibernate_after_minutes = value);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn interface_style_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::InterfaceStyle);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                self.prefs.interface_style().title().to_owned(),
+                "interface-style-dropdown",
+                open,
+                SettingsMenu::InterfaceStyle,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn interface_style_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self.prefs.interface_style();
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::InterfaceStyle::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("interface-style-option-{index}"),
+                choice.title().to_owned(),
+                choice == current,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.set_interface_style(choice));
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn pane_density_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::PaneDensity);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                self.prefs.pane_density.title().to_owned(),
+                "pane-density-dropdown",
+                open,
+                SettingsMenu::PaneDensity,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn pane_density_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::PaneDensity::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("pane-density-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.pane_density,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.pane_density = choice);
                     cx.notify();
                 },
             ));
@@ -5220,12 +5789,20 @@ impl UtilitySurfaces {
                         ))
                         .child(appearance_divider(colors))
                         .child(appearance_setting_row(
-                            t("settings.appearance.glass_window"),
-                            window_material_switch(
-                                self.prefs.window_material == WindowMaterial::Glass,
-                                colors,
-                                cx,
-                            ),
+                            t("settings.appearance.theme_files"),
+                            self.theme_files_control(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            t("settings.appearance.interface_style"),
+                            self.interface_style_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            t("settings.appearance.density"),
+                            self.pane_density_dropdown(cx),
                             colors,
                         ))
                         .child(appearance_divider(colors))
@@ -5341,6 +5918,22 @@ impl UtilitySurfaces {
                         ))
                         .child(appearance_divider(colors))
                         .child(toggle_row(
+                            t("settings.appearance.shell_integration"),
+                            t("settings.appearance.shell_integration_detail"),
+                            self.prefs.terminal_shell_integration,
+                            "terminal_shell_integration",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_shell_integration;
+                                this.update_prefs(move |prefs| {
+                                    prefs.terminal_shell_integration = enabled
+                                });
+                                cx.notify();
+                            },
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row(
                             t("settings.appearance.last_folder"),
                             t("settings.appearance.last_folder_detail"),
                             self.prefs.terminal_follows_last_directory,
@@ -5354,7 +5947,15 @@ impl UtilitySurfaces {
                                 });
                                 cx.notify();
                             },
-                        )),
+                        ))
+                        .when(cfg!(target_os = "macos"), |rows| {
+                            rows.child(appearance_divider(colors))
+                                .child(default_terminal_row(
+                                    self.default_terminal_state,
+                                    colors,
+                                    cx,
+                                ))
+                        }),
                 ),
             colors,
         )
@@ -6540,8 +7141,7 @@ impl Render for UtilitySurfaces {
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                        .bg(self.colors().background)
-                        .child(overlay),
+                        .child(self.settings_island(overlay)),
                 );
                 if self.usage_share.is_some() {
                     page.child(self.usage_share_overlay(window, cx))
@@ -6971,6 +7571,66 @@ fn login_item_row(
                 .when(!enabled, |toggle| toggle.justify_start())
                 .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
         )
+}
+
+/// "Default terminal": what Launch Services reports, and a button that asks
+/// it to send diri the links and files. Nothing changes without that click.
+fn default_terminal_row(
+    state: crate::default_terminal::DefaultTerminalState,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    div()
+        .id("default-terminal")
+        .debug_selector(|| "default-terminal".into())
+        .min_h(px(SETTINGS_ROW_HEIGHT))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(t("default_terminal.title")),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "default-terminal-detail".into())
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if state.failed() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(state.detail().into())),
+                ),
+        )
+        .when(state.can_make_default(), |row| {
+            row.child(surface_button(
+                t("default_terminal.make_default"),
+                "make-default-terminal",
+                colors,
+                cx,
+                |this, cx| this.make_default_terminal(cx),
+            ))
+        })
 }
 
 fn setting_section(
@@ -7575,35 +8235,6 @@ fn appearance_setting_row(
 
 /// Blur the desktop behind the window, or paint it solid. Solid is cheaper
 /// for the compositor, so the choice stays one click away from the theme.
-fn window_material_switch(
-    enabled: bool,
-    colors: SemanticColors,
-    cx: &mut Context<UtilitySurfaces>,
-) -> impl IntoElement {
-    div()
-        .id("window-material")
-        .flex_none()
-        .w(px(30.0))
-        .h(px(18.0))
-        .p(px(2.0))
-        .rounded(px(9.0))
-        .bg(if enabled {
-            Ink::FRESH.alpha(0.72)
-        } else {
-            colors.primary.alpha(0.14)
-        })
-        .flex()
-        .justify_end()
-        .when(!enabled, |toggle| toggle.justify_start())
-        .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| {
-            let material = this.prefs.window_material.toggled();
-            this.update_prefs(move |prefs| prefs.window_material = material);
-            cx.notify();
-        }))
-        .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary))
-}
-
 /// Drag toward "less" for a denser tint, toward "more" for clearer glass. The
 /// shipped density sits on a tick; clicking the value label returns to it.
 fn window_transparency_slider(
@@ -7834,6 +8465,9 @@ fn settings_select_button(
             } else {
                 Some(menu)
             };
+            if this.settings_menu == Some(SettingsMenu::TerminalTheme) {
+                this.open_terminal_theme_menu();
+            }
             if this.settings_menu == Some(SettingsMenu::TerminalFont) {
                 // Read on open, so a font installed while diri runs shows up;
                 // the last listing shows meanwhile.
@@ -7870,7 +8504,9 @@ fn settings_dropdown(
             .w(px(width))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(FloatingSurface::new(colors, content)),
+            // Over settings rows with nothing blurring behind it, so the
+            // menu must hide the labels under it outright.
+            .child(FloatingSurface::new(colors, content).opaque(true)),
     )
     .with_priority(5)
 }
@@ -8280,7 +8916,7 @@ pub(crate) fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
         ProtoAgentKind::CURSOR_ID => diri_ui::AgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => diri_ui::AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => diri_ui::AgentKind::Shell,
-        _ => diri_ui::AgentKind::Generic,
+        id => diri_ui::AgentKind::from_agent_id(id),
     }
 }
 
@@ -8565,6 +9201,47 @@ mod tests {
                 window.refresh();
             })
             .expect("scroll to privacy settings");
+            cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_DEFAULT_TERMINAL=default|not-default|failed` seeds
+        // Settings > Terminal > Default terminal (tests never ask Launch
+        // Services) and scrolls to it at the bottom of the page.
+        if let Ok(seed) = std::env::var("DIRI_VISUAL_DEFAULT_TERMINAL") {
+            use crate::default_terminal::{DefaultTerminalState, DefaultTerminalStatus};
+            let state = DefaultTerminalState {
+                status: if seed == "default" {
+                    DefaultTerminalStatus::Default
+                } else {
+                    DefaultTerminalStatus::NotDefault
+                },
+                failure: (seed == "failed").then_some(-54),
+            };
+            cx.update_window(window.into(), |root, window, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.default_terminal_task = None;
+                    surfaces.default_terminal_state = state;
+                    cx.notify();
+                });
+                window.refresh();
+            })
+            .expect("seed default terminal");
+            cx.run_until_parked();
+            cx.update_window(window.into(), |root, window, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, _| {
+                    let bottom = surfaces.settings_scroll.max_offset().y;
+                    surfaces.settings_scroll.set_offset(point(px(0.0), -bottom));
+                });
+                window.refresh();
+            })
+            .expect("scroll to default terminal");
             cx.run_until_parked();
         }
         if std::env::var("DIRI_VISUAL_SETTINGS_TAB").as_deref() == Ok("whats-new") {
@@ -9416,6 +10093,24 @@ mod tests {
                             cx.notify();
                         });
                     }
+                    if std::env::var_os("DIRI_APPEARANCE_THEME_STATUS").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.theme_file_status = Some(ThemeFileStatus::Imported(1));
+                            cx.notify();
+                        });
+                    }
+                    if std::env::var_os("DIRI_APPEARANCE_THEME_MENU").is_some() {
+                        let query = std::env::var("DIRI_APPEARANCE_THEME_QUERY").ok();
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.settings_menu = Some(SettingsMenu::TerminalTheme);
+                            surfaces.open_terminal_theme_menu();
+                            if let Some(query) = &query {
+                                surfaces.theme_search.insert(query);
+                                surfaces.theme_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            }
+                            cx.notify();
+                        });
+                    }
                     if std::env::var_os("DIRI_APPEARANCE_FILE_EDITOR_MENU").is_some() {
                         harness.surfaces.update(cx, |surfaces, cx| {
                             surfaces.settings_menu = Some(SettingsMenu::FileEditor);
@@ -9438,6 +10133,93 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
         screenshot.save(output).expect("save appearance screenshot");
+    }
+
+    /// Renders Settings > Agents with launch arguments on one Agent and the
+    /// arguments editor open, for reviewing the row and editor together.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic agents-settings screenshot artifact"]
+    fn render_agents_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let item =
+            |kind: ProtoAgentKind, label: &str, args: &[&str]| diri_proto::AgentReadinessItem {
+                binary: kind.id().to_owned(),
+                path: Some(format!("/opt/homebrew/bin/{}", kind.id())),
+                path_source: Some(diri_proto::AgentPathSource::SystemPath),
+                show_in_quick_create: true,
+                launch_args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                descriptor: Some(diri_proto::AgentDescriptor {
+                    display_name: label.to_owned(),
+                    ..Default::default()
+                }),
+                kind,
+                ..Default::default()
+            };
+        let window = cx
+            .open_window(size(px(1200.0), px(700.0)), move |window, cx| {
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Agents, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness.surfaces.update(cx, |surfaces, cx| {
+                        surfaces
+                            .store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .set_agent_catalog(diri_proto::AgentReadinessResult {
+                                agents: vec![
+                                    item(
+                                        ProtoAgentKind::CLAUDE_CODE,
+                                        "Claude Code",
+                                        &["--dangerously-skip-permissions"],
+                                    ),
+                                    item(ProtoAgentKind::CODEX, "Codex", &[]),
+                                ],
+                                ..Default::default()
+                            });
+                        if std::env::var_os("DIRI_AGENTS_ARGS_EDITOR").is_some() {
+                            surfaces.agent_path_editor = Some(AgentPathEditor {
+                                kind: ProtoAgentKind::CODEX,
+                                host: None,
+                                field: AgentEditorField::Arguments,
+                                configured_path: None,
+                                path: text_editor("--yolo"),
+                                show_in_quick_create: true,
+                                error: None,
+                            });
+                        }
+                        cx.notify();
+                    });
+                });
+                harness
+            })
+            .expect("open headless agents settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh agents settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture agents settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save agents settings screenshot");
     }
 
     struct SettingsModalHarness {
@@ -9649,6 +10431,12 @@ mod tests {
                     );
                     if std::env::var_os("DIRI_VISUAL_ACCOUNT_HANDOFF").is_some() {
                         surfaces.seed_account_handoff_preview();
+                    }
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_FIRST_RUN").is_some() {
+                        surfaces.seed_account_first_run_preview();
+                    }
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_STATES").is_some() {
+                        surfaces.seed_account_states_preview();
                     }
                 }
                 surfaces
@@ -10031,7 +10819,13 @@ mod tests {
             .debug_bounds("settings-shell")
             .expect("settings shell should render");
 
-        assert_eq!(shell, root);
+        // Comfortable insets the page by the island gap on every side.
+        let gap = px(crate::store::PaneDensity::default().island_gap());
+        assert_eq!(shell.origin, root.origin + gpui::point(gap, gap));
+        assert_eq!(
+            shell.size,
+            gpui::size(root.size.width - gap * 2.0, root.size.height - gap * 2.0)
+        );
     }
 
     #[gpui::test]
@@ -10389,10 +11183,13 @@ mod tests {
         assert_eq!(navigation.size.width, sidebar.size.width);
         assert_eq!(
             shell.left(),
-            sidebar.right(),
-            "the settings page should begin where the sidebar ends"
+            sidebar.right() + px(crate::store::PaneDensity::default().island_gap()),
+            "the settings page should begin where the sidebar ends, past the island gap"
         );
-        assert_eq!(shell.right(), px(1200.0));
+        assert_eq!(
+            shell.right(),
+            px(1200.0 - crate::store::PaneDensity::default().island_gap())
+        );
         assert!(cx.debug_bounds("SETTINGS_TAB_General").is_some());
         harness.read_with(cx, |harness, cx| {
             assert!(harness.sidebar.read(cx).shows_settings());
@@ -10514,7 +11311,7 @@ mod tests {
         );
         assert_eq!(
             shell.left(),
-            px(320.0),
+            px(320.0) + px(crate::store::PaneDensity::default().island_gap()),
             "the page stays against the sidebar as the seam is dragged"
         );
     }

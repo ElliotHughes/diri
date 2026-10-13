@@ -34,6 +34,8 @@ mod workspace_palette_tests;
 mod gesture_acceptance_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod gesture_schedule_profile;
+#[cfg(all(test, target_os = "macos"))]
+mod split_pane_tests;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -220,6 +222,23 @@ enum QuoteSurface {
 ///
 /// Takes the slide by `&mut Option<_>` rather than hanging off `RootView` so
 /// both seams can be advanced in one pass without borrowing all of `self`.
+/// `DIRI_VISUAL_BACKDROP=gradient` (a soft blue wallpaper, like the blurred
+/// desktop the real window sits over) or `=<rrggbb>` for a flat colour.
+#[cfg(test)]
+fn test_desktop_backdrop() -> Option<gpui::Background> {
+    let value = std::env::var("DIRI_VISUAL_BACKDROP").ok()?;
+    if value == "gradient" {
+        return Some(gpui::linear_gradient(
+            135.0,
+            gpui::linear_color_stop(gpui::rgb(0x0b2a4f), 0.0),
+            gpui::linear_color_stop(gpui::rgb(0x2c6db3), 1.0),
+        ));
+    }
+    u32::from_str_radix(&value, 16)
+        .ok()
+        .map(|hex| gpui::rgb(hex).into())
+}
+
 /// The platform window background that realizes a preferred material.
 pub(crate) fn window_background(material: WindowMaterial) -> WindowBackgroundAppearance {
     match material {
@@ -623,6 +642,20 @@ impl RootView {
             cx.subscribe_in(
                 navigation,
                 window,
+                |this, _, request: &crate::sidebar::AccountRequest, _, cx| {
+                    if request == &crate::sidebar::AccountRequest::Refresh {
+                        let _ = this.services.usage_limits_refresh.try_send(());
+                    }
+                    let services = this.services.clone();
+                    this.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.account_menu_action(request.clone(), services, cx);
+                    });
+                },
+            )
+            .detach();
+            cx.subscribe_in(
+                navigation,
+                window,
                 |this, _, command: &crate::palette_workspace::WorkspaceCommand, window, cx| {
                     let handled = this.sidebar.update(cx, |sidebar, cx| {
                         sidebar.run_workspace_palette(command.clone(), window, cx)
@@ -790,11 +823,7 @@ impl RootView {
                     this.sidebar_panel_width = this.sidebar_seam;
                     this.sidebar_float = 0.0;
                     this.tabs_slide = None;
-                    this.tabs_target = if this.sidebar.read(cx).horizontal_tabs_visible() {
-                        crate::tab_navigation::TAB_STRIP_HEIGHT
-                    } else {
-                        0.0
-                    };
+                    this.tabs_target = this.sidebar.read(cx).horizontal_tabs_height();
                     this.tabs_seam = this.tabs_target;
                 } else {
                     this.begin_sidebar_slide(cx);
@@ -866,8 +895,19 @@ impl RootView {
                 surfaces,
                 window,
                 |this, _, event: &crate::surface_shell::UtilitySurfacesEvent, window, cx| {
-                    if let crate::surface_shell::UtilitySurfacesEvent::ShowWhatsNew(page) = event {
-                        this.open_whats_new_at(*page, window, cx);
+                    use crate::surface_shell::UtilitySurfacesEvent;
+                    match event {
+                        UtilitySurfacesEvent::ShowWhatsNew(page) => {
+                            this.open_whats_new_at(*page, window, cx);
+                        }
+                        UtilitySurfacesEvent::RefreshUsageLimits => {
+                            let _ = this.services.usage_limits_refresh.try_send(());
+                        }
+                        // The sign-in tab is selected: show it, ready to type.
+                        UtilitySurfacesEvent::AccountLoginOpened => {
+                            this.sidebar
+                                .update(cx, |_, cx| cx.emit(SidebarEvent::SessionActivated));
+                        }
                     }
                 },
             )
@@ -1148,6 +1188,12 @@ impl RootView {
                             sidebar.set_usage(snapshot.clone(), cx);
                         });
                         let _ = this.update(cx, |this, cx| {
+                            if let Some(navigation) = &this.navigation {
+                                let limits = snapshot.limits.clone();
+                                navigation.update(cx, |navigation, cx| {
+                                    navigation.set_account_limits(limits, cx)
+                                });
+                            }
                             if let Some(surfaces) = &this.utility_surfaces {
                                 surfaces.update(cx, |surfaces, cx| surfaces.set_usage(snapshot, cx));
                             }
@@ -1278,6 +1324,12 @@ impl RootView {
                                 (false, false, Vec::new())
                             };
                             this.open_api_requests(api_requests, cx);
+                            // The sidebar opens the selected session's
+                            // workspace while it renders; a hidden or idle
+                            // sidebar would leave ⌘D with no workspace until
+                            // something repainted it.
+                            this.sidebar
+                                .update(cx, |sidebar, cx| sidebar.settle_workspace_navigation(cx));
                             if open_launcher {
                                 this.open_launcher(&OpenLauncher, window, cx);
                             }
@@ -1348,11 +1400,7 @@ impl RootView {
             0.0
         };
         let inspector_seam = if inspector_open { inspector_width } else { 0.0 };
-        let tabs_seam = if sidebar.read(cx).horizontal_tabs_visible() {
-            crate::tab_navigation::TAB_STRIP_HEIGHT
-        } else {
-            0.0
-        };
+        let tabs_seam = sidebar.read(cx).horizontal_tabs_height();
         #[cfg(target_os = "macos")]
         let (browser, mut browser_events) = NativeBrowser::new();
         #[cfg(target_os = "macos")]
@@ -1635,19 +1683,6 @@ impl RootView {
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Notice(message) => {
                             this.show_feedback("workspace", Toast::info(message.clone()), cx)
                         }
-                        crate::workspace_workbench::WorkspaceWorkbenchEvent::RequestSplit {
-                            tab,
-                            pane,
-                            edge,
-                        } => this.sidebar.update(cx, |sidebar, cx| {
-                            sidebar.choose_split_session(
-                                tab.clone(),
-                                pane.clone(),
-                                *edge,
-                                window,
-                                cx,
-                            )
-                        }),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::RevealSession(id),
                         ) => this.open_workspace_launch_session(id.clone(), window, cx),
@@ -1730,7 +1765,7 @@ impl RootView {
 
     /// Pushes the preferred window material to the platform window when it
     /// changes. The window opens with the right material already; this only
-    /// follows the settings toggle afterwards.
+    /// follows the interface style afterwards, including a palette preview.
     fn sync_window_material(&mut self, window: &Window) {
         let material = self
             .services
@@ -1738,8 +1773,8 @@ impl RootView {
             .store
             .read()
             .expect("session store lock poisoned")
-            .preferences()
-            .window_material;
+            .interface_style()
+            .material();
         if self.applied_material == Some(material) {
             return;
         }
@@ -2378,8 +2413,8 @@ impl RootView {
     /// context. This is the only place that translates static commands into
     /// mutations of RootView's child modules.
     fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(command) = crate::workspace_workbench::PaneCommand::from_id(command) {
-            if (self.sidebar.read(cx).workspace_menu_is_open()
+        if let Some(pane) = crate::workspace_workbench::PaneCommand::from_id(command) {
+            let blocked = (self.sidebar.read(cx).workspace_menu_is_open()
                 || self.sidebar.read(cx).project_picker_active())
                 || self.launcher.read(cx).is_open()
                 || self
@@ -2395,17 +2430,32 @@ impl RootView {
                     .as_ref()
                     .is_some_and(|view| view.read(cx).tab_peek_visible())
                 || (self.launches_expanded && self.launches_focus.contains_focused(window, cx))
-                || self.quote_target_picker.is_some()
-            {
+                || self.quote_target_picker.is_some();
+            let handled = !blocked
+                && self.active_workspace.is_some()
+                && self.workspace_workbench.clone().is_some_and(|workbench| {
+                    workbench.update(cx, |workbench, cx| {
+                        workbench.execute_command(pane, window, cx)
+                    })
+                });
+            if handled {
                 return;
             }
-            if self.active_workspace.is_some()
-                && let Some(workbench) = &self.workspace_workbench
-            {
-                workbench.update(cx, |workbench, cx| {
-                    workbench.execute_command(command, window, cx)
-                });
-            } else {
+            // ⌥⌘arrows and ⌘[ / ⌘] move between sessions wherever there is
+            // no second pane to move to, as they did before splits.
+            if let Some(forward) = pane.session_fallback() {
+                self.run_command(
+                    if forward {
+                        CommandId::SelectNextSession
+                    } else {
+                        CommandId::SelectPreviousSession
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+            if !blocked && self.active_workspace.is_none() {
                 self.show_feedback(
                     "workspace",
                     Toast::info(crate::i18n::t("toast.workspace_open_to_arrange")),
@@ -2530,6 +2580,28 @@ impl RootView {
                     }
                 }
             }
+            CommandId::ComfortableDensity | CommandId::CompactDensity => {
+                let density = if command == CommandId::ComfortableDensity {
+                    crate::store::PaneDensity::Comfortable
+                } else {
+                    crate::store::PaneDensity::Compact
+                };
+                let result = self
+                    .window_store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .update_preferences(|prefs| prefs.pane_density = density);
+                match result {
+                    Ok(()) => self.services.store.publish_local_change(),
+                    Err(error) => self.show_feedback(
+                        "prefs",
+                        Toast::error(crate::i18n::t("toast.density_failed"))
+                            .detail(error.to_string()),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            }
             CommandId::ToggleTabOrientation
             | CommandId::HorizontalTabs
             | CommandId::VerticalTabs => {
@@ -2607,6 +2679,17 @@ impl RootView {
                 }
             }
             CommandId::ToggleAuxiliaryTerminal => {
+                // A tab's terminal is a pane of its split tree. The inspector
+                // terminal and the pre-split lower pane remain for windows
+                // without a layout.
+                if self.active_workspace.is_some()
+                    && !self.preview
+                    && let Some(workbench) = self.workspace_workbench.clone()
+                    && workbench
+                        .update(cx, |workbench, cx| workbench.toggle_bottom_pane(window, cx))
+                {
+                    return;
+                }
                 self.open_auxiliary_terminal(window, cx);
             }
             CommandId::QuoteSelection => self.quote_selection(false, window, cx),
@@ -2710,6 +2793,43 @@ impl RootView {
             }),
         }
         true
+    }
+
+    /// A link or file macOS handed diri as the default terminal: a new local
+    /// terminal running its argv, or the reason it will not run.
+    pub(crate) fn open_external(
+        &mut self,
+        request: Result<crate::open_handler::OpenRequest, crate::open_handler::OpenError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview {
+            return;
+        }
+        let workspace_target = self.workspace_spawn_target();
+        let mut store = self
+            .window_store
+            .write()
+            .expect("session store lock poisoned");
+        match request {
+            Ok(request) => {
+                // An explicit directory keeps it local: a link names a program
+                // on this Mac, never one on the default remote host.
+                let cwd = request
+                    .cwd
+                    .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                store.spawn_shell(SpawnOptions {
+                    workspace_target,
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    title: Some(request.title),
+                    argv: Some(request.argv),
+                    ..SpawnOptions::default()
+                });
+            }
+            Err(error) => store.report_open_failure(error.detail()),
+        }
+        drop(store);
+        cx.notify();
     }
 
     /// ⌥⌘N: a note Session in the current project, created like ⌘T creates
@@ -3338,6 +3458,31 @@ impl RootView {
             })
         });
         if closed_workspace {
+            return;
+        }
+        // ⌘W in a split tab closes the focused pane: its shell ends and the
+        // Engine collapses the split. The owner's pane is the tab itself.
+        let pane = self
+            .active_workspace
+            .as_ref()
+            .and(self.workspace_workbench.as_ref())
+            .filter(|workbench| {
+                workbench
+                    .read(cx)
+                    .focused_terminal()
+                    .is_some_and(|terminal| terminal.read(cx).is_focused(window))
+            })
+            .and_then(|workbench| workbench.read(cx).closable_pane_session());
+        if let Some(pane) = pane {
+            if let Some(workbench) = self.workspace_workbench.clone() {
+                workbench.update(cx, |workbench, cx| {
+                    workbench.focus_before_closing(&pane, window, cx)
+                });
+            }
+            self.window_store
+                .write()
+                .expect("session store lock poisoned")
+                .remove_sessions(vec![pane]);
             return;
         }
         let closed = self
@@ -4010,14 +4155,22 @@ impl RootView {
         } else {
             0.0
         };
+        // Comfortable density floats the card (or, in a workspace, each pane)
+        // as an island inset by this much window chrome on every side.
+        let density = self
+            .window_store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density;
+        let gap = density.island_gap();
+        let islands = density.islands();
+        let origin_x = sidebar_width + gap;
+        let origin_y = gap;
         let card_width =
-            (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
-        let tabs_height = if self.sidebar.read(cx).horizontal_tabs_visible() {
-            crate::tab_navigation::TAB_STRIP_HEIGHT
-        } else {
-            0.0
-        };
-        let card_height = (f32::from(viewport_size.height) - tabs_height).max(0.0);
+            (f32::from(viewport_size.width) - sidebar_width - inspector_width - 2.0 * gap).max(0.0);
+        let tabs_height = self.sidebar.read(cx).horizontal_tabs_height();
+        let card_height = (f32::from(viewport_size.height) - tabs_height - 2.0 * gap).max(0.0);
         if self.tabs_target != tabs_height {
             self.tabs_target = tabs_height;
             self.tabs_slide = (!cx.reduce_motion())
@@ -4058,13 +4211,13 @@ impl RootView {
                 .and_then(|terminal| terminal.read(cx).page_geometry());
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.sync_resident_buffers(buffers);
-                surfaces.set_tab_peek_region(sidebar_width, tabs_height, card_width, cx);
+                surfaces.set_tab_peek_region(origin_x, origin_y + tabs_height, card_width, cx);
                 // Last frame's primary pane, which is the page a pinch picks
                 // up; the whole card when no pane has been laid out yet.
                 let page = page_geometry.unwrap_or((
                     crate::terminal_pane::TerminalViewport {
-                        x: sidebar_width,
-                        y: tabs_height,
+                        x: origin_x,
+                        y: origin_y + tabs_height,
                         width: card_width,
                         height: card_height,
                     },
@@ -4082,6 +4235,12 @@ impl RootView {
                 );
             });
         }
+        // In a workspace each pane is its own island, so the card itself is
+        // only the chrome between them.
+        let card_island = islands && self.active_workspace.is_none();
+        // Horizontal tabs in comfortable sit on the chrome above the island,
+        // so the body, not the whole card, is the island.
+        let strip_on_chrome = card_island && self.tabs_seam > 0.0;
         let mut card = div()
             .relative()
             .flex_1()
@@ -4089,11 +4248,20 @@ impl RootView {
             .flex_col()
             .h_full()
             .min_w(px(0.0))
-            .when(seam <= 0.0, |card| card.rounded_tl(px(Radius::CARD)))
-            .when(inspector_seam <= 0.0, |card| {
+            .when(!islands && seam <= 0.0, |card| {
+                card.rounded_tl(px(Radius::CARD))
+            })
+            .when(!islands && inspector_seam <= 0.0, |card| {
                 card.rounded_tr(px(Radius::CARD))
             })
-            .bg(terminal.work_surface_nested())
+            .when(card_island && !strip_on_chrome, |card| {
+                card.rounded(px(Radius::CARD))
+            })
+            // A workspace's islands sit on the chrome painted around the
+            // card, so the card itself stays clear there.
+            .when((!islands || card_island) && !strip_on_chrome, |card| {
+                card.bg(terminal.work_surface_nested())
+            })
             .overflow_hidden()
             .text_color(terminal.primary);
 
@@ -4118,20 +4286,30 @@ impl RootView {
         // borderless sidebar title bar even though both are 42 points tall.
         // The sidebar owns the shared divider; only draw our left edge when
         // it is hidden. Bottom corners stay square against the window edge.
-        let card_outline = div()
-            .absolute()
-            .inset_0()
-            .when(seam <= 0.0, |outline| outline.rounded_tl(px(Radius::CARD)))
-            .when(inspector_seam <= 0.0, |outline| {
-                outline.rounded_tr(px(Radius::CARD))
-            })
-            .border_t_1()
-            .border_b_1()
-            .when(seam <= 0.0, |outline| outline.border_l_1())
-            // Mirror of the left edge: the right panel owns the divider while
-            // it is on screen, so the seam is one hairline rather than two.
-            .when(inspector_seam <= 0.0, |outline| outline.border_r_1())
-            .border_color(terminal.primary.alpha(0.10));
+        let card_outline = if islands {
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(px(Radius::CARD))
+                .when(card_island, |outline| outline.border_1())
+                .border_color(terminal.primary.alpha(0.10))
+        } else {
+            div()
+                .absolute()
+                .inset_0()
+                .when(seam <= 0.0, |outline| outline.rounded_tl(px(Radius::CARD)))
+                .when(inspector_seam <= 0.0, |outline| {
+                    outline.rounded_tr(px(Radius::CARD))
+                })
+                .border_t_1()
+                .border_b_1()
+                .when(seam <= 0.0, |outline| outline.border_l_1())
+                // Mirror of the left edge: the right panel owns the divider
+                // while it is on screen, so the seam is one hairline rather
+                // than two.
+                .when(inspector_seam <= 0.0, |outline| outline.border_r_1())
+                .border_color(terminal.primary.alpha(0.10))
+        };
 
         if let Some(workbench) = &self.workspace_workbench {
             let external_owner = if terminal_in_workspace_panel
@@ -4144,7 +4322,9 @@ impl RootView {
             } else {
                 None
             };
-            let inspector_toggle = !self.inspector_open && !self.preview;
+            // Horizontal tabs carry the toggle beside their +, so no pane
+            // title bar repeats it.
+            let inspector_toggle = !self.inspector_open && !self.preview && tabs_height <= 0.0;
             workbench.update(cx, |workbench, _| {
                 workbench.set_external_owner(external_owner);
                 workbench.set_inspector_toggle(inspector_toggle);
@@ -4153,17 +4333,21 @@ impl RootView {
         if terminal_in_workspace_panel && let Some(auxiliary) = &self.auxiliary_terminal {
             auxiliary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, true, cx);
+                terminal.set_island_corners(islands, cx);
                 terminal.set_header_trailing_inset(0.0, cx);
+                // Comfortable: the panel is an island inset by the gap, and
+                // its header is the gap shorter (see `inspector_island`).
+                let top = Metrics::TITLE_BAR - gap;
                 terminal.set_viewport(
                     TerminalViewport {
-                        x: sidebar_width + card_width,
+                        x: origin_x + card_width + gap,
                         // The pane sits under the inspector header. Counting
                         // that header in the height sizes the PTY past the
                         // painted grid, so a wrapped line parks the prompt on
                         // a row scrollback cannot reach.
-                        y: Metrics::TITLE_BAR,
-                        width: inspector_width,
-                        height: (f32::from(viewport_size.height) - Metrics::TITLE_BAR).max(0.0),
+                        y: top,
+                        width: (inspector_width - gap).max(0.0),
+                        height: (f32::from(viewport_size.height) - top - gap).max(0.0),
                     },
                     cx,
                 );
@@ -4193,7 +4377,22 @@ impl RootView {
                     primary.update(cx, |terminal, cx| {
                         terminal.render_hosted_header_actions(sidebar_colors, held_hint, cx)
                     })
+                })
+                .or_else(|| {
+                    // A split workspace has no single pane to host; the strip
+                    // still ends with the right sidebar's toggle.
+                    (self.active_workspace.is_some() && !self.inspector_open && !self.preview).then(
+                        || {
+                            crate::right_panel::dispatching_toggle(
+                                "strip-toggle-inspector",
+                                false,
+                                sidebar_colors,
+                                held_hint,
+                            )
+                        },
+                    )
                 });
+            let strip_height = self.sidebar.read(cx).tab_strip_height();
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
                 sidebar.render_horizontal_tabs(card_width, trailing, window, cx)
@@ -4208,8 +4407,8 @@ impl RootView {
                     .child(
                         div()
                             .relative()
-                            .top(px(self.tabs_seam - crate::tab_navigation::TAB_STRIP_HEIGHT))
-                            .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
+                            .top(px(self.tabs_seam - strip_height))
+                            .h(px(strip_height))
                             .child(strip),
                     ),
             );
@@ -4227,7 +4426,10 @@ impl RootView {
             .w_full()
             .h(px(card_height))
             .min_h(px(0.0))
-            .bg(terminal.work_surface_nested());
+            .when(card_island, |body| body.rounded(px(Radius::CARD)))
+            .when(!islands || card_island, |body| {
+                body.bg(terminal.work_surface_nested())
+            });
         if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
             body = body.child(page);
         } else if self.active_workspace.is_some() {
@@ -4237,8 +4439,8 @@ impl RootView {
                     workbench.set_tab(
                         tab,
                         TerminalViewport {
-                            x: sidebar_width,
-                            y: tabs_height,
+                            x: origin_x,
+                            y: origin_y + tabs_height,
                             width: card_width,
                             height: card_height,
                         },
@@ -4268,11 +4470,12 @@ impl RootView {
             if let Some(primary) = &self.terminal {
                 primary.update(cx, |terminal, cx| {
                     terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
+                    terminal.set_island_corners(card_island, cx);
                     terminal.set_header_hidden(hosts_pane_actions, cx);
                     terminal.set_viewport(
                         TerminalViewport {
-                            x: sidebar_width,
-                            y: tabs_height,
+                            x: origin_x,
+                            y: origin_y + tabs_height,
                             width: card_width,
                             height: heights.primary,
                         },
@@ -4301,10 +4504,11 @@ impl RootView {
             if let Some(terminal) = &self.auxiliary_terminal {
                 terminal.update(cx, |terminal, cx| {
                     terminal.set_header_trailing_inset(48.0, cx);
+                    terminal.set_island_corners(card_island, cx);
                     terminal.set_viewport(
                         TerminalViewport {
-                            x: sidebar_width,
-                            y: tabs_height + heights.primary + 1.0,
+                            x: origin_x,
+                            y: origin_y + tabs_height + heights.primary + 1.0,
                             width: card_width,
                             height: heights.auxiliary,
                         },
@@ -4362,11 +4566,12 @@ impl RootView {
             self.terminal_available_height = card_height;
             primary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
+                terminal.set_island_corners(card_island, cx);
                 terminal.set_header_hidden(hosts_pane_actions, cx);
                 terminal.set_viewport(
                     TerminalViewport {
-                        x: sidebar_width,
-                        y: tabs_height,
+                        x: origin_x,
+                        y: origin_y + tabs_height,
                         width: card_width,
                         height: card_height,
                     },
@@ -4393,7 +4598,27 @@ impl RootView {
                 }
             });
         }
-        card.child(body).child(card_outline).into_any_element()
+        let card = if strip_on_chrome {
+            card.child(body.child(card_outline))
+        } else {
+            card.child(body).child(card_outline)
+        };
+        if !islands {
+            return card.into_any_element();
+        }
+        // The chrome around the island paints the sidebar's material, so the
+        // card reads as lifted off the same surface the navigation sits on.
+        div()
+            .id("island-chrome")
+            .debug_selector(|| "island-chrome".into())
+            .flex_1()
+            .flex()
+            .h_full()
+            .min_w(px(0.0))
+            .p(px(gap))
+            .bg(terminal.sidebar_surface())
+            .child(card)
+            .into_any_element()
     }
 
     fn preview_workbench(&self, colors: SemanticColors) -> AnyElement {
@@ -5126,6 +5351,13 @@ impl Render for RootView {
             .absolute()
             .size_full()
         });
+        let islands = self
+            .window_store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density
+            .islands();
         let sidebar_wrapper = div()
             .id("sidebar-frame")
             .absolute()
@@ -5177,7 +5409,14 @@ impl Render for RootView {
                                 .top_0()
                                 .bottom_0()
                                 .w(px(1.0))
-                                .bg(colors.sidebar_stroke().opacity(1.0 - self.sidebar_float)),
+                                // Islands sit apart from the sidebar on its own
+                                // material; a hairline there would double the
+                                // edge the gap already draws.
+                                .bg(colors.sidebar_stroke().opacity(if islands {
+                                    0.0
+                                } else {
+                                    1.0 - self.sidebar_float
+                                })),
                         ),
                 )
             });
@@ -5297,6 +5536,21 @@ impl Render for RootView {
             .on_action(
                 cx.listener(|this, _: &crate::commands::SplitPaneBelow, window, cx| {
                     this.run_command(CommandId::SplitPaneBelow, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusPreviousPane, window, cx| {
+                    this.run_command(CommandId::FocusPreviousPane, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusNextPane, window, cx| {
+                    this.run_command(CommandId::FocusNextPane, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::EqualizePanes, window, cx| {
+                    this.run_command(CommandId::EqualizePanes, window, cx);
                 }),
             )
             .on_action(
@@ -5425,6 +5679,16 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &commands::VerticalTabs, window, cx| {
                 this.run_command(CommandId::VerticalTabs, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &commands::ComfortableDensity, window, cx| {
+                    this.run_command(CommandId::ComfortableDensity, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &commands::CompactDensity, window, cx| {
+                    this.run_command(CommandId::CompactDensity, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 this.run_command(CommandId::FocusSidebar, window, cx);
             }))
@@ -5539,6 +5803,11 @@ impl Render for RootView {
             ))
             .child(div().flex_none().h_full().w(px(seam)))
             .when(seam > 0.0, |root| root.child(self.resize_handle(cx)));
+        let settings_over_glass = colors.material() == diri_ui::Material::Glass
+            && self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|surfaces| surfaces.read(cx).is_settings_open());
         if launcher_open {
             // Command-N behaves like an unsaved new tab: preserve the app
             // shell, but replace the live session pane instead of floating a
@@ -5557,14 +5826,26 @@ impl Render for RootView {
                     ),
             );
         } else {
-            root = root.child(self.terminal_card(
+            let card = self.terminal_card(
                 sidebar_visible,
                 seam,
                 inspector_width,
                 inspector_seam,
                 window,
                 cx,
-            ));
+            );
+            // Settings paints the same glass as the card it stands over; the
+            // card keeps its layout (and every PTY its size) but must not
+            // read through it.
+            root = root.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .when(settings_over_glass, |card| card.invisible())
+                    .child(card),
+            );
         }
         if inspector_seam > 0.0 {
             // The handle is deferred so it wins hit tests against the terminal.
@@ -5578,6 +5859,43 @@ impl Render for RootView {
                 root = root.child(self.inspector_resize_handle(cx));
             }
             if let Some(inspector) = &self.inspector {
+                let density = self
+                    .window_store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .preferences()
+                    .pane_density;
+                let islands = density.islands();
+                let gap = density.island_gap();
+                inspector.update(cx, |inspector, cx| inspector.set_island(islands, cx));
+                // Comfortable: an island on the chrome, like the terminal
+                // card beside it, whose own gap separates the two. Compact:
+                // flush, the hairline the only edge between two terminal fills.
+                // Pinned to the seam, so the panel's leading edge travels
+                // with the slide and the rest follows from off-window.
+                let panel = div()
+                    .absolute()
+                    .top(px(gap))
+                    .left(px(0.0))
+                    .h(px(
+                        (f32::from(window.viewport_size().height) - 2.0 * gap).max(0.0)
+                    ))
+                    .w(px((inspector_panel_width - gap).max(0.0)))
+                    .child(
+                        inspector
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
+                    .when(islands, |panel| {
+                        panel.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(Radius::CARD))
+                                .border_1()
+                                .border_color(crate::right_panel::panel_divider(colors)),
+                        )
+                    });
                 root = root.child(
                     div()
                         .relative()
@@ -5585,23 +5903,15 @@ impl Render for RootView {
                         .h_full()
                         .w(px(inspector_seam))
                         .overflow_hidden()
+                        .when(settings_over_glass, |panel| panel.invisible())
+                        .when(islands, |chrome| chrome.bg(colors.sidebar_surface()))
                         // The panel paints the terminal's own fill, so this
                         // hairline is all that separates the two surfaces.
-                        .border_l_1()
-                        .border_color(crate::right_panel::panel_divider(colors))
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(0.0))
-                                .left(px(0.0))
-                                .h_full()
-                                .w(px(inspector_panel_width))
-                                .child(
-                                    inspector
-                                        .clone()
-                                        .cached(StyleRefinement::default().size_full()),
-                                ),
-                        ),
+                        .when(!islands, |edge| {
+                            edge.border_l_1()
+                                .border_color(crate::right_panel::panel_divider(colors))
+                        })
+                        .child(panel),
                 );
             }
         }
@@ -5711,10 +6021,17 @@ impl Render for RootView {
         if let Some(overlay) = self.perf_overlay(colors, window, cx) {
             root = root.child(overlay);
         }
-        root.child(crate::telemetry::frame_probe(
+        let root = root.child(crate::telemetry::frame_probe(
             frame_started,
             self.frame_context(cx),
-        ))
+        ));
+        // Fixtures stand a fake desktop behind the window: headless windows
+        // have nothing there, so glass would capture as transparent pixels.
+        #[cfg(test)]
+        if let Some(desktop) = test_desktop_backdrop() {
+            return div().size_full().bg(desktop).child(root).into_any_element();
+        }
+        root.into_any_element()
     }
 }
 
@@ -7678,6 +7995,8 @@ mod tests {
                 .update_preferences(|prefs| {
                     prefs.active_workspace = Some(workspace);
                     prefs.sidebar_visible = true;
+                    // Edge-to-edge geometry is the compact contract.
+                    prefs.pane_density = crate::store::PaneDensity::Compact;
                 })
                 .unwrap();
         }
@@ -7728,7 +8047,8 @@ mod tests {
                     if horizontal {
                         let project = cx.debug_bounds("horizontal-tab-project").unwrap();
                         if cfg!(target_os = "macos") {
-                            assert!(project.left() >= px(92.0), "tabs overlap traffic lights");
+                            // The lights end about 72 pt from the window's left edge.
+                            assert!(project.left() >= px(74.0), "tabs overlap traffic lights");
                         }
                     }
                 }
@@ -7833,7 +8153,8 @@ mod tests {
         });
         assert_eq!(
             horizontal.height,
-            before.height - crate::tab_navigation::TAB_STRIP_HEIGHT
+            before.height
+                - crate::tab_navigation::tab_strip_height(crate::store::PaneDensity::default())
         );
         assert!(horizontal.width > before.width);
         assert_eq!(horizontal.y, crate::tab_navigation::TAB_STRIP_HEIGHT);
@@ -8052,14 +8373,15 @@ mod tests {
             root.terminal.as_ref().unwrap().read(cx).header_hidden()
         }));
 
-        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        let trigger_bounds = cx.debug_bounds("session-links-trigger").unwrap();
+        let trigger = trigger_bounds.center();
         cx.simulate_click(trigger, Modifiers::default());
         cx.run_until_parked();
         let panel = cx
             .debug_bounds("session-links-panel")
             .expect("the hosted trigger still opens the pane's links popover");
         assert!(
-            panel.top() >= strip.bottom(),
+            panel.top() >= trigger_bounds.bottom(),
             "the popover drops from the strip-hosted trigger: {panel:?}"
         );
         cx.simulate_click(trigger, Modifiers::default());
@@ -9930,6 +10252,231 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Every interface style at both densities, in a 2x2 workspace like the
+    /// layout Superlogical demonstrates them on. Writes
+    /// `<style>-<density>.png` into `DIRI_STYLE_SCREENSHOTS`.
+    /// `DIRI_STYLE_THEME=<theme id>` picks the color theme (default
+    /// dirijor-dark); `DIRI_STYLE_ONLY=modern-comfortable,...` narrows the set;
+    /// `DIRI_STYLE_SIDEBAR=0` hides the sidebar; `DIRI_STYLE_SINGLE=1` shows
+    /// the selected session alone instead of the workspace;
+    /// `DIRI_STYLE_SETTINGS=1` opens Settings over it. Run it with
+    /// `DIRI_VISUAL_BACKDROP=gradient` so glass has a desktop to show.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes interface style screenshots to DIRI_STYLE_SCREENSHOTS"]
+    fn render_interface_style_screenshots() {
+        use crate::store::{InterfaceStyle, PaneDensity};
+        use diri_proto::workspace::*;
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_STYLE_SCREENSHOTS").expect("DIRI_STYLE_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let theme = std::env::var("DIRI_STYLE_THEME").unwrap_or_else(|_| "dirijor-dark".into());
+        let only = std::env::var("DIRI_STYLE_ONLY").ok();
+        let sidebar = std::env::var("DIRI_STYLE_SIDEBAR").as_deref() != Ok("0");
+        let single = std::env::var_os("DIRI_STYLE_SINGLE").is_some();
+        let orientation = if std::env::var_os("DIRI_STYLE_HORIZONTAL").is_some() {
+            crate::store::TabOrientation::Horizontal
+        } else {
+            crate::store::TabOrientation::Vertical
+        };
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let name = |style: InterfaceStyle| match style {
+            InterfaceStyle::Modern => "modern",
+            InterfaceStyle::System => "system",
+            InterfaceStyle::Themed => "themed",
+            InterfaceStyle::Blended => "blended",
+        };
+        for style in InterfaceStyle::ALL {
+            for density in PaneDensity::ALL {
+                let file = format!(
+                    "{}-{}",
+                    name(style),
+                    if density.islands() {
+                        "comfortable"
+                    } else {
+                        "compact"
+                    }
+                );
+                if only
+                    .as_ref()
+                    .is_some_and(|only| !only.split(',').any(|item| item == file))
+                {
+                    continue;
+                }
+                let services = test_services();
+                let workspace = WorkspaceId::new("style-workspace");
+                let pane = |id: &str, session: &str| LayoutNode::Pane {
+                    id: PaneId::new(id),
+                    session_id: SessionId::new(session),
+                };
+                {
+                    let mut store = services.store.store.write().unwrap();
+                    store.hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
+                    store
+                        .update_preferences(|prefs| {
+                            prefs.terminal_theme = theme.clone();
+                            prefs.set_interface_style(style);
+                            prefs.pane_density = density;
+                            prefs.sidebar_visible = sidebar;
+                            prefs.inspector_open =
+                                std::env::var_os("DIRI_STYLE_INSPECTOR").is_some();
+                        })
+                        .unwrap();
+                    store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                        revision: 1,
+                        workspaces: vec![WorkspaceRecord {
+                            project_id: None,
+                            id: workspace.clone(),
+                            name: "diri".into(),
+                            selected_tab: Some(TabId::new("style-tab")),
+                            tabs: vec![WorkspaceTab {
+                                id: TabId::new("style-tab"),
+                                title: Some("~/fun/diri".into()),
+                                focused_pane: PaneId::new("c-shell"),
+                                zoomed_pane: None,
+                                layout: LayoutNode::Split {
+                                    id: SplitId::new("columns"),
+                                    axis: LayoutAxis::Horizontal,
+                                    fraction: 0.5,
+                                    first: Box::new(LayoutNode::Split {
+                                        id: SplitId::new("left"),
+                                        axis: LayoutAxis::Vertical,
+                                        fraction: 0.5,
+                                        first: Box::new(pane("a-git", "preview-claude")),
+                                        second: Box::new(pane("b-json", "preview-codex")),
+                                    }),
+                                    second: Box::new(LayoutNode::Split {
+                                        id: SplitId::new("right"),
+                                        axis: LayoutAxis::Vertical,
+                                        fraction: 0.5,
+                                        first: Box::new(pane("c-shell", "preview-cursor")),
+                                        second: Box::new(pane("d-test", "preview-shell")),
+                                    }),
+                                },
+                            }],
+                        }],
+                        ..Default::default()
+                    });
+                }
+                let window = cx
+                    .open_window(size(px(1200.0), px(760.0)), |window, cx| {
+                        cx.new(|cx| {
+                            let root =
+                                RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                            root.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.set_tab_orientation(orientation, cx).unwrap();
+                                if !single {
+                                    sidebar.activate_workspace(Some(workspace), cx);
+                                }
+                            });
+                            root
+                        })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window.into(), |root, _, cx| {
+                    let root = root.downcast::<RootView>().unwrap();
+                    if single {
+                        let terminal = root.read(cx).terminal.clone().unwrap();
+                        let mut grid = diri_term::buffer::GridBuffer::new(100, 30);
+                        for (y, line) in [
+                            "~/fun/diri main* ≡",
+                            "❯ cargo test -p diri-ui",
+                            "   Compiling diri-ui v0.9.6",
+                            "running 4 tests",
+                            "test glass_alpha_clears ... ok",
+                            "test neutral_palette ... ok",
+                            "test islands_inset ... ok",
+                            "test result: ok. 4 passed",
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            for (x, ch) in line.chars().enumerate() {
+                                grid.cells[y * 100 + x].scalar = ch as u32;
+                            }
+                        }
+                        terminal.update(cx, |terminal, cx| {
+                            terminal.seed_preview_grid_for_test(grid, cx);
+                            cx.notify();
+                        });
+                    } else {
+                        let workbench = root.read(cx).workspace_workbench.clone().unwrap();
+                        workbench
+                            .update(cx, |workbench, cx| workbench.seed_styled_panes_for_test(cx));
+                    }
+                })
+                .unwrap();
+                // `DIRI_STYLE_SETTINGS=1`: Settings › Terminal (appearance)
+                // open over the same window, where it stands in for the card.
+                if std::env::var_os("DIRI_STYLE_SETTINGS").is_some() {
+                    cx.update_window(window.into(), |root, window, cx| {
+                        let root = root.downcast::<RootView>().unwrap();
+                        root.update(cx, |root, cx| {
+                            root.run_command(CommandId::OpenSettings, window, cx);
+                            let surfaces = root.utility_surfaces.clone().unwrap();
+                            surfaces.update(cx, |surfaces, cx| {
+                                surfaces
+                                    .open_settings_tab(crate::settings::SettingsTab::Terminal, cx)
+                            });
+                            cx.notify();
+                        });
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                }
+                cx.run_until_parked();
+                // `DIRI_STYLE_SLIDE=1`: open the right sidebar and capture its
+                // slide at fixed points of the curve (a capture takes longer
+                // than the whole slide, so the start time is rewound instead).
+                if std::env::var_os("DIRI_STYLE_SLIDE").is_some() {
+                    for step in 0..=10 {
+                        let progress = step as f32 / 10.0;
+                        cx.update_window(window.into(), |root, _, cx| {
+                            let root = root.downcast::<RootView>().unwrap();
+                            root.update(cx, |root, cx| {
+                                if step == 0 {
+                                    root.set_inspector_open(true, cx);
+                                }
+                                root.inspector_slide = crate::seam::SeamSlide::begin_at(
+                                    0.0,
+                                    1.0,
+                                    std::time::Instant::now()
+                                        - crate::seam::SEAM_SLIDE.mul_f32(progress),
+                                );
+                                cx.notify();
+                            });
+                        })
+                        .unwrap();
+                        cx.capture_screenshot(window.into())
+                            .unwrap()
+                            .save(
+                                std::path::Path::new(&output)
+                                    .join(format!("{file}-slide-{step:02}.png")),
+                            )
+                            .unwrap();
+                    }
+                }
+                cx.capture_screenshot(window.into())
+                    .unwrap()
+                    .save(std::path::Path::new(&output).join(format!("{file}.png")))
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes the complete tab peek workbench to DIRI_PEEK_ROOT_SCREENSHOT"]
@@ -11468,7 +12015,7 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-d"));
+        cx.simulate_keystrokes(&commands::test_chords("cmd-alt-b"));
         cx.run_until_parked();
         assert!(
             root.read_with(cx, |root, _| root.inspector_open),
@@ -11524,7 +12071,11 @@ mod tests {
             .debug_bounds("INSPECTOR_TOGGLE")
             .expect("an open panel carries the toggle in its own title bar");
         assert!(
-            toggle.right() >= px(1200.0 - Metrics::TOOLBAR_EDGE_INSET - 1.0),
+            toggle.right()
+                >= px(1200.0
+                    - Metrics::TOOLBAR_EDGE_INSET
+                    - crate::store::PaneDensity::default().island_gap()
+                    - 1.0),
             "the open panel's toggle ends the window's title bar: {toggle:?}"
         );
         assert!(
@@ -11650,6 +12201,50 @@ mod tests {
         assert!(
             !root.read_with(cx, |root, _| root.notification_panel_open),
             "clicking the notification trigger again must close the panel without reopening it"
+        );
+    }
+
+    #[gpui::test]
+    fn the_hidden_sidebar_button_clears_the_traffic_lights_in_both_densities(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut lefts = Vec::new();
+        for density in crate::store::PaneDensity::ALL {
+            let services = test_services();
+            let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+                .list
+                .sessions[0]
+                .clone();
+            {
+                let mut store = services.store.store.write().expect("store");
+                store.upsert_session(session.clone());
+                store.select(session.id);
+                store
+                    .update_preferences(|prefs| {
+                        prefs.pane_density = density;
+                        prefs.sidebar_visible = false;
+                    })
+                    .unwrap();
+            }
+            let (_root, cx) = cx.add_window_view(move |window, cx| {
+                RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            });
+            cx.simulate_resize(size(px(1_000.0), px(700.0)));
+            cx.run_until_parked();
+            let button = cx
+                .debug_bounds("show-sidebar")
+                .expect("a hidden sidebar leaves its reveal button in the title bar");
+            // The lights span 20 pt to about 72 pt from the window's left edge.
+            assert!(
+                button.left() >= px(74.0),
+                "{density:?}: the button sits under the traffic lights: {button:?}"
+            );
+            lefts.push(button.left());
+        }
+        // Compact's 1 pt pane edge is the only difference.
+        assert!(
+            (lefts[0] - lefts[1]).abs() <= px(1.0),
+            "the button keeps its place across densities: {lefts:?}"
         );
     }
 

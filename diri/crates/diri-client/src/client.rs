@@ -607,6 +607,25 @@ impl DaemonClient {
         Ok(record.id)
     }
 
+    /// Spawns and places the session in a tab's split tree in one request.
+    /// An Engine without placement ignores `pane` and leaves it unplaced.
+    pub async fn spawn_placed(
+        &self,
+        params: SessionSpawnParams,
+        pane: diri_proto::workspace::SpawnPane,
+    ) -> Result<SessionId, ClientError> {
+        #[derive(Serialize)]
+        struct Placed {
+            #[serde(flatten)]
+            params: SessionSpawnParams,
+            pane: diri_proto::workspace::SpawnPane,
+        }
+        let record: SessionSpawnResult = self
+            .typed(Method::SESSION_SPAWN, &Placed { params, pane })
+            .await?;
+        Ok(record.id)
+    }
+
     pub async fn kill(&self, session_id: &SessionId) -> Result<(), ClientError> {
         self.empty(Method::SESSION_KILL, &session_params(session_id))
             .await
@@ -651,6 +670,39 @@ impl DaemonClient {
     ) -> Result<SessionTerminalTitleResult, ClientError> {
         self.typed(Method::SESSION_TERMINAL_TITLE, &session_params(session_id))
             .await
+    }
+
+    /// The whole of an inline image a terminal placed, read in chunks.
+    /// Errors with `image_not_found` once the Engine (or a remote session's
+    /// Holder) evicted it.
+    pub async fn read_image(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+    ) -> Result<diri_proto::SessionReadImageResult, ClientError> {
+        let mut params = diri_proto::SessionReadImageParams {
+            session_id: session_id.clone(),
+            key: key.to_owned(),
+            offset: 0,
+        };
+        let mut image: diri_proto::SessionReadImageResult =
+            self.typed(Method::SESSION_READ_IMAGE, &params).await?;
+        let total = usize::try_from(image.total)
+            .unwrap_or(usize::MAX)
+            .min(diri_proto::inline_image::MAX_IMAGE_BYTES);
+        while image.data.len() < total {
+            params.offset = image.data.len() as u64;
+            let chunk: diri_proto::SessionReadImageResult =
+                self.typed(Method::SESSION_READ_IMAGE, &params).await?;
+            // A replaced image under the same key cannot happen (keys are
+            // never reused); an empty chunk would otherwise loop forever.
+            if chunk.data.is_empty() || chunk.offset != params.offset {
+                break;
+            }
+            image.data.extend_from_slice(&chunk.data);
+        }
+        image.data.truncate(total);
+        Ok(image)
     }
 
     pub async fn process_info(
@@ -920,6 +972,13 @@ impl DaemonClient {
         self.empty(Method::GOVERNOR_CONFIGURE, &params).await
     }
 
+    pub async fn configure_terminal(
+        &self,
+        params: TerminalConfigureParams,
+    ) -> Result<(), ClientError> {
+        self.empty(Method::TERMINAL_CONFIGURE, &params).await
+    }
+
     /// `agent.readiness`: PATH metadata locally, but a remote target crosses
     /// ssh and may install the Helper first, so the two carry very different
     /// bounds. Both are explicit: the settings page shows a spinner for the
@@ -1133,6 +1192,43 @@ impl DaemonClient {
 
     pub async fn account_profiles(&self) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
         self.no_params(Method::ACCOUNT_PROFILES_LIST).await
+    }
+
+    /// The catalog with who each local login belongs to. It may ask Claude
+    /// about a login it has not described yet, so it allows a few seconds.
+    pub async fn account_overview(&self) -> Result<diri_proto::AgentAccountOverview, ClientError> {
+        self.core
+            .request_typed::<EmptyParams, _>(
+                Method::ACCOUNT_OVERVIEW,
+                None,
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .await
+    }
+
+    /// Save the login an Agent uses now as a profile named after its email.
+    pub async fn adopt_account(
+        &self,
+        agent: String,
+    ) -> Result<diri_proto::AgentAccountOverview, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_ADOPT,
+                Some(&diri_proto::AgentAccountAgent { agent }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+    }
+
+    /// A new profile for the Agent and the sign-in tab that fills it.
+    pub async fn add_account(&self, agent: String) -> Result<SessionRecord, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_ADD,
+                Some(&diri_proto::AgentAccountAgent { agent }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
     }
 
     pub async fn login_codex_account(&self, id: String) -> Result<SessionRecord, ClientError> {
@@ -1825,6 +1921,7 @@ mod tests {
                     same_repo_as: None,
                     start_directory: None,
                     note_id: None,
+                    argv: None,
                 })
                 .await?;
 

@@ -12,6 +12,7 @@ mod commands;
 mod composer;
 #[cfg(unix)]
 mod daemon_launch;
+mod default_terminal;
 mod delegation;
 mod details_ui;
 mod dev_build;
@@ -36,6 +37,7 @@ mod herdr_import;
 pub mod history;
 mod i18n;
 mod icons;
+mod imported_themes;
 mod inspector;
 mod launch_recipe;
 mod launcher;
@@ -49,6 +51,7 @@ mod notes;
 mod notification_feed;
 pub mod notifications;
 mod number_flow;
+mod open_handler;
 #[cfg(test)]
 mod overview_fixture;
 mod overview_zoom;
@@ -382,6 +385,11 @@ fn main() {
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         tokio.spawn(async move {
             let mut last_request: Option<std::time::Instant> = None;
+            // Beside the Engine's state, so dev builds keep their own. Not
+            // the socket's directory: on Linux that is cleared at logout.
+            let mut memory = usage::limits::LimitsMemory::load(
+                diri_proto::paths::DirijorPaths::state_dir(&home).join("account-limits.json"),
+            );
             while limits_requests.recv().await.is_some() {
                 if last_request.is_some_and(|last| last.elapsed() < Duration::from_secs(10)) {
                     continue;
@@ -396,10 +404,10 @@ fn main() {
                 {
                     continue;
                 }
-                let Ok(accounts) = client.account_profiles().await else {
+                let Ok(accounts) = client.account_overview().await else {
                     continue;
                 };
-                let limits = usage::limits::refresh(&home, &accounts).await;
+                let limits = usage::limits::refresh(&home, &accounts, &mut memory).await;
                 usage_tx.send_modify(|snapshot| snapshot.limits = limits);
             }
         });
@@ -459,6 +467,15 @@ fn main() {
         }
         cx.activate(true);
     });
+    // Links and files macOS sends diri as the default terminal (`ssh://`,
+    // `x-man-page://`, `.command`, …). They can arrive before the first window
+    // exists, so they queue until the app below is ready for them.
+    let (open_links_tx, mut open_links_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    if !preview {
+        app.on_open_urls(move |links| {
+            let _ = open_links_tx.send(links);
+        });
+    }
     app.run(move |cx: &mut App| {
         load_system_fonts(cx);
         telemetry::install(cx);
@@ -671,6 +688,13 @@ fn main() {
         if let Some(startup) = services.daemon_startup.as_ref() {
             startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
         }
+        let open_services = Arc::clone(&services);
+        cx.spawn(async move |cx| {
+            while let Some(links) = open_links_rx.recv().await {
+                cx.update(|cx| open_links(cx, &open_services, scenario, &links));
+            }
+        })
+        .detach();
         if smoke_test {
             cx.spawn(async move |cx| {
                 cx.background_executor()
@@ -833,6 +857,56 @@ enum WindowOpen {
     Context(NativeWindowContext),
 }
 
+/// Opens each link in a new terminal tab of the frontmost diri window,
+/// opening a window first when none is left.
+fn open_links(
+    cx: &mut App,
+    services: &Arc<AppServices>,
+    scenario: PreviewScenario,
+    links: &[String],
+) {
+    let requests: Vec<_> = links
+        .iter()
+        .map(|link| open_handler::request_for(link, &open_handler::LocalSystem))
+        .collect();
+    let mut windows = cx.windows();
+    if let Some(active) = cx.active_window() {
+        windows.retain(|handle| *handle != active);
+        windows.insert(0, active);
+    }
+    let opened = windows.into_iter().any(|handle| {
+        handle
+            .update(cx, |root, window, cx| {
+                let Ok(root) = root.downcast::<RootView>() else {
+                    return false;
+                };
+                window.activate_window();
+                root.update(cx, |root, cx| {
+                    for request in &requests {
+                        root.open_external(request.clone(), cx);
+                    }
+                });
+                true
+            })
+            .unwrap_or(false)
+    });
+    if !opened {
+        let handle = open_main_window(
+            cx,
+            Arc::clone(services),
+            false,
+            scenario,
+            RestorePolicy::FRAME_ONLY,
+        );
+        let _ = handle.update(cx, |root, _, cx| {
+            for request in requests {
+                root.open_external(request, cx);
+            }
+        });
+    }
+    cx.activate(true);
+}
+
 fn open_main_window(
     cx: &mut App,
     services: Arc<AppServices>,
@@ -937,9 +1011,10 @@ fn open_window(
                 title,
                 appears_transparent: cfg!(target_os = "macos"),
                 // GPUI uses top/left insets here: AppKit's native 8 pt origin plus the
-                // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top.
+                // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top,
+                // plus 3 pt so the 14 pt buttons centre on the 48 pt title bar.
                 traffic_light_position: cfg!(target_os = "macos")
-                    .then_some(point(px(20.0), px(14.0))),
+                    .then_some(point(px(20.0), px(17.0))),
             }),
             ..Default::default()
         },

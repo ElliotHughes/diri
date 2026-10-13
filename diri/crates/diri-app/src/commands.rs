@@ -53,6 +53,9 @@ actions!(
         FocusPaneDown,
         SplitPaneRight,
         SplitPaneBelow,
+        FocusPreviousPane,
+        FocusNextPane,
+        EqualizePanes,
         TogglePaneZoom,
         RemoveFocusedPane,
         PaneGrowWidth,
@@ -83,6 +86,8 @@ actions!(
         ToggleTabOrientation,
         HorizontalTabs,
         VerticalTabs,
+        ComfortableDensity,
+        CompactDensity,
         FocusSidebar,
         ToggleInspector,
         ToggleAuxiliaryTerminal,
@@ -134,6 +139,7 @@ actions!(
         ExportScrollback,
         PreviousPrompt,
         NextPrompt,
+        CopyLastCommandOutput,
     ]
 );
 
@@ -163,6 +169,9 @@ pub enum CommandId {
     FocusPaneDown,
     SplitPaneRight,
     SplitPaneBelow,
+    FocusPreviousPane,
+    FocusNextPane,
+    EqualizePanes,
     TogglePaneZoom,
     RemoveFocusedPane,
     PaneGrowWidth,
@@ -188,6 +197,8 @@ pub enum CommandId {
     ToggleTabOrientation,
     HorizontalTabs,
     VerticalTabs,
+    ComfortableDensity,
+    CompactDensity,
     FocusSidebar,
     ToggleInspector,
     ToggleAuxiliaryTerminal,
@@ -228,6 +239,7 @@ pub enum CommandId {
     ExportScrollback,
     PreviousPrompt,
     NextPrompt,
+    CopyLastCommandOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,8 +485,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         FocusPaneLeft,
         "focus-pane-left",
-        Some("ctrl-alt-left"),
-        Some("⌃⌥←"),
+        Some("cmd-alt-left"),
+        Some("⌥⌘←"),
         Some(APP_CONTEXT),
         "command.focus_pane_left.palette_title",
         "rectangle.split.2x1",
@@ -483,8 +495,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         FocusPaneRight,
         "focus-pane-right",
-        Some("ctrl-alt-right"),
-        Some("⌃⌥→"),
+        Some("cmd-alt-right"),
+        Some("⌥⌘→"),
         Some(APP_CONTEXT),
         "command.focus_pane_right.palette_title",
         "rectangle.split.2x1",
@@ -493,8 +505,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         FocusPaneUp,
         "focus-pane-up",
-        Some("ctrl-alt-up"),
-        Some("⌃⌥↑"),
+        Some("cmd-alt-up"),
+        Some("⌥⌘↑"),
         Some(APP_CONTEXT),
         "command.focus_pane_up.palette_title",
         "rectangle.split.2x1",
@@ -503,8 +515,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         FocusPaneDown,
         "focus-pane-down",
-        Some("ctrl-alt-down"),
-        Some("⌃⌥↓"),
+        Some("cmd-alt-down"),
+        Some("⌥⌘↓"),
         Some(APP_CONTEXT),
         "command.focus_pane_down.palette_title",
         "rectangle.split.2x1",
@@ -523,12 +535,42 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         SplitPaneBelow,
         "split-pane-below",
-        Some("cmd-alt-shift-d"),
-        Some("⇧⌥⌘D"),
+        Some("cmd-shift-d"),
+        Some("⇧⌘D"),
         Some(APP_CONTEXT),
         "command.split_pane_below.palette_title",
         "rectangle.split.2x1",
         "workspace split pane below add layout"
+    ),
+    spec!(
+        FocusPreviousPane,
+        "focus-previous-pane",
+        Some("cmd-["),
+        Some("⌘["),
+        Some(APP_CONTEXT),
+        "command.focus_previous_pane.palette_title",
+        "rectangle.split.2x1",
+        "workspace focus pane previous cycle"
+    ),
+    spec!(
+        FocusNextPane,
+        "focus-next-pane",
+        Some("cmd-]"),
+        Some("⌘]"),
+        Some(APP_CONTEXT),
+        "command.focus_next_pane.palette_title",
+        "rectangle.split.2x1",
+        "workspace focus pane next cycle"
+    ),
+    spec!(
+        EqualizePanes,
+        "equalize-panes",
+        Some("cmd-ctrl-="),
+        Some("⌃⌘="),
+        Some(APP_CONTEXT),
+        "command.equalize_panes.palette_title",
+        "rectangle.split.2x1",
+        "workspace equalize balance even panes sizes"
     ),
     spec!(
         TogglePaneZoom,
@@ -781,6 +823,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         "tab placement orientation side"
     ),
     spec!(
+        ComfortableDensity,
+        "comfortable-density",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.comfortable_density.palette_title",
+        "square.grid.2x2",
+        "density islands spacing comfortable panes layout appearance"
+    ),
+    spec!(
+        CompactDensity,
+        "compact-density",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.compact_density.palette_title",
+        "rectangle.split.2x1",
+        "density compact border panes layout appearance"
+    ),
+    spec!(
         FocusSidebar,
         "focus-sidebar",
         Some("cmd-shift-b"),
@@ -793,8 +855,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         ToggleInspector,
         "toggle-inspector",
-        Some("cmd-shift-d"),
-        Some("⇧⌘D"),
+        Some("cmd-alt-b"),
+        Some("⌥⌘B"),
         Some(APP_CONTEXT)
     ),
     spec!(
@@ -905,20 +967,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         "square.stack.3d.up",
         "developer renders render count redraw views perf performance debug"
     ),
-    spec_with_alternates!(
+    // ⌥⌘arrows and ⌘[ / ⌘] are pane keys now; in a one-pane tab they still
+    // move between sessions (`PaneCommand::session_fallback`).
+    spec!(
         SelectPreviousSession,
         "select-previous-session",
-        Some("cmd-alt-left"),
-        ["cmd-alt-up", "cmd-["],
-        Some("⌥⌘←"),
+        Some("cmd-{"),
+        Some("⇧⌘["),
         Some(SESSION_NAVIGATION_CONTEXT)
     ),
-    spec_with_alternates!(
+    spec!(
         SelectNextSession,
         "select-next-session",
-        Some("cmd-alt-right"),
-        ["cmd-alt-down", "cmd-]"],
-        Some("⌥⌘→"),
+        Some("cmd-}"),
+        Some("⇧⌘]"),
         Some(SESSION_NAVIGATION_CONTEXT)
     ),
     spec!(
@@ -1115,6 +1177,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "arrow.down",
         "terminal message prompt next conversation"
     ),
+    spec!(
+        CopyLastCommandOutput,
+        "terminal-copy-last-command-output",
+        Some("cmd-alt-o"),
+        Some("⌘⌥O"),
+        Some(TERMINAL_CONTEXT),
+        "command.copy_last_command_output.palette_title",
+        "doc.on.doc",
+        "terminal shell command output copy last osc 133"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1303,6 +1375,9 @@ impl CommandSpec {
             CommandId::FocusPaneDown => KeyBinding::new(key, FocusPaneDown, context),
             CommandId::SplitPaneRight => KeyBinding::new(key, SplitPaneRight, context),
             CommandId::SplitPaneBelow => KeyBinding::new(key, SplitPaneBelow, context),
+            CommandId::FocusPreviousPane => KeyBinding::new(key, FocusPreviousPane, context),
+            CommandId::FocusNextPane => KeyBinding::new(key, FocusNextPane, context),
+            CommandId::EqualizePanes => KeyBinding::new(key, EqualizePanes, context),
             CommandId::TogglePaneZoom => KeyBinding::new(key, TogglePaneZoom, context),
             CommandId::RemoveFocusedPane => KeyBinding::new(key, RemoveFocusedPane, context),
             CommandId::PaneGrowWidth => KeyBinding::new(key, PaneGrowWidth, context),
@@ -1329,6 +1404,8 @@ impl CommandSpec {
             CommandId::ToggleTabOrientation => KeyBinding::new(key, ToggleTabOrientation, context),
             CommandId::HorizontalTabs => KeyBinding::new(key, HorizontalTabs, context),
             CommandId::VerticalTabs => KeyBinding::new(key, VerticalTabs, context),
+            CommandId::ComfortableDensity => KeyBinding::new(key, ComfortableDensity, context),
+            CommandId::CompactDensity => KeyBinding::new(key, CompactDensity, context),
             CommandId::FocusSidebar => KeyBinding::new(key, FocusSidebar, context),
             CommandId::ToggleInspector => KeyBinding::new(key, ToggleInspector, context),
             CommandId::ToggleAuxiliaryTerminal => {
@@ -1387,6 +1464,9 @@ impl CommandSpec {
             CommandId::ExportScrollback => KeyBinding::new(key, ExportScrollback, context),
             CommandId::PreviousPrompt => KeyBinding::new(key, PreviousPrompt, context),
             CommandId::NextPrompt => KeyBinding::new(key, NextPrompt, context),
+            CommandId::CopyLastCommandOutput => {
+                KeyBinding::new(key, CopyLastCommandOutput, context)
+            }
         }
     }
 }
@@ -1414,6 +1494,17 @@ fn linux_keystroke(id: CommandId, key: &str) -> Option<String> {
     // Cmd-Ctrl-T would land on New Tab's Ctrl-Shift-T.
     if id == CommandId::ShowTodos {
         return Some("ctrl-alt-shift-t".to_owned());
+    }
+    // Ctrl-[ is Escape in a terminal; the pane cycle stays in the palette.
+    if matches!(id, CommandId::FocusPreviousPane | CommandId::FocusNextPane) {
+        return None;
+    }
+    // Linux keeps session navigation where it was.
+    if id == CommandId::SelectPreviousSession {
+        return Some("ctrl-alt-left".to_owned());
+    }
+    if id == CommandId::SelectNextSession {
+        return Some("ctrl-alt-right".to_owned());
     }
     let pane_focus = match id {
         CommandId::FocusPaneLeft => Some("ctrl-alt-h"),
@@ -1694,6 +1785,21 @@ impl CommandId {
                 description: t("command.split_pane_below.description"),
                 category: Workspace,
             },
+            Self::FocusPreviousPane => ShortcutMetadata {
+                title: t("command.focus_previous_pane.title"),
+                description: t("command.focus_previous_pane.description"),
+                category: Workspace,
+            },
+            Self::FocusNextPane => ShortcutMetadata {
+                title: t("command.focus_next_pane.title"),
+                description: t("command.focus_next_pane.description"),
+                category: Workspace,
+            },
+            Self::EqualizePanes => ShortcutMetadata {
+                title: t("command.equalize_panes.title"),
+                description: t("command.equalize_panes.description"),
+                category: Workspace,
+            },
             Self::TogglePaneZoom => ShortcutMetadata {
                 title: t("command.toggle_pane_zoom.title"),
                 description: t("command.toggle_pane_zoom.description"),
@@ -1872,6 +1978,11 @@ impl CommandId {
                     category: Workspace,
                 }
             }
+            Self::ComfortableDensity | Self::CompactDensity => ShortcutMetadata {
+                title: t("command.density.title"),
+                description: t("command.density.description"),
+                category: Workspace,
+            },
             Self::ToggleSidebar => ShortcutMetadata {
                 title: t("command.toggle_sidebar.title"),
                 description: t("command.toggle_sidebar.description"),
@@ -1955,6 +2066,11 @@ impl CommandId {
             Self::NextPrompt => ShortcutMetadata {
                 title: t("command.next_prompt.title"),
                 description: t("command.next_prompt.description"),
+                category: ShortcutCategory::Terminal,
+            },
+            Self::CopyLastCommandOutput => ShortcutMetadata {
+                title: t("command.copy_last_command_output.title"),
+                description: t("command.copy_last_command_output.description"),
                 category: ShortcutCategory::Terminal,
             },
             Self::CopySelection => ShortcutMetadata {
@@ -2051,6 +2167,9 @@ impl CommandId {
             Self::FocusPaneDown => Box::new(FocusPaneDown),
             Self::SplitPaneRight => Box::new(SplitPaneRight),
             Self::SplitPaneBelow => Box::new(SplitPaneBelow),
+            Self::FocusPreviousPane => Box::new(FocusPreviousPane),
+            Self::FocusNextPane => Box::new(FocusNextPane),
+            Self::EqualizePanes => Box::new(EqualizePanes),
             Self::TogglePaneZoom => Box::new(TogglePaneZoom),
             Self::RemoveFocusedPane => Box::new(RemoveFocusedPane),
             Self::PaneGrowWidth => Box::new(PaneGrowWidth),
@@ -2077,6 +2196,8 @@ impl CommandId {
             Self::ToggleTabOrientation => Box::new(ToggleTabOrientation),
             Self::HorizontalTabs => Box::new(HorizontalTabs),
             Self::VerticalTabs => Box::new(VerticalTabs),
+            Self::ComfortableDensity => Box::new(ComfortableDensity),
+            Self::CompactDensity => Box::new(CompactDensity),
             Self::FocusSidebar => Box::new(FocusSidebar),
             Self::ToggleInspector => Box::new(ToggleInspector),
             Self::ToggleAuxiliaryTerminal => Box::new(ToggleAuxiliaryTerminal),
@@ -2117,6 +2238,7 @@ impl CommandId {
             Self::ExportScrollback => Box::new(ExportScrollback),
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
+            Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
         }
     }
 }
@@ -2355,13 +2477,30 @@ mod tests {
             assert_eq!(command(id).context, Some(SESSION_NAVIGATION_CONTEXT));
         }
         assert_eq!(
-            command(CommandId::SelectPreviousSession).alternate_keystrokes,
-            ["cmd-alt-up", "cmd-["]
+            command(CommandId::SelectPreviousSession).keystroke,
+            Some("cmd-{")
         );
         assert_eq!(
-            command(CommandId::SelectNextSession).alternate_keystrokes,
-            ["cmd-alt-down", "cmd-]"]
+            command(CommandId::SelectNextSession).keystroke,
+            Some("cmd-}")
         );
+    }
+
+    #[test]
+    fn multiplexer_keys_match_harness() {
+        for (id, key) in [
+            (CommandId::SplitPaneRight, "cmd-d"),
+            (CommandId::SplitPaneBelow, "cmd-shift-d"),
+            (CommandId::FocusPaneLeft, "cmd-alt-left"),
+            (CommandId::FocusPaneDown, "cmd-alt-down"),
+            (CommandId::FocusPreviousPane, "cmd-["),
+            (CommandId::FocusNextPane, "cmd-]"),
+            (CommandId::TogglePaneZoom, "cmd-shift-enter"),
+            (CommandId::EqualizePanes, "cmd-ctrl-="),
+            (CommandId::ToggleInspector, "cmd-alt-b"),
+        ] {
+            assert_eq!(command(id).keystroke, Some(key), "{id:?}");
+        }
     }
 
     #[test]
@@ -2419,9 +2558,9 @@ mod tests {
     fn conflicts_include_alternate_bindings() {
         let overrides = ShortcutOverrides::new();
         let conflict =
-            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-["), &overrides)
-                .expect("navigation alternate should be reserved");
-        assert_eq!(conflict.id, CommandId::SelectPreviousSession);
+            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-+"), &overrides)
+                .expect("an alternate binding should be reserved");
+        assert_eq!(conflict.id, CommandId::ZoomIn);
     }
 
     #[test]
@@ -2445,9 +2584,9 @@ mod tests {
     #[test]
     fn modal_passthrough_matching_uses_registry_bindings() {
         #[cfg(target_os = "macos")]
-        let (launcher, previous, other) = ("cmd-n", "cmd-[", "cmd-t");
+        let (launcher, previous, other) = ("cmd-n", "cmd-{", "cmd-t");
         #[cfg(not(target_os = "macos"))]
-        let (launcher, previous, other) = ("ctrl-n", "ctrl-[", "ctrl-t");
+        let (launcher, previous, other) = ("ctrl-n", "ctrl-alt-left", "ctrl-t");
         assert!(matches_keystroke(
             CommandId::OpenLauncher,
             &Keystroke::parse(launcher).unwrap()

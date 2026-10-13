@@ -174,6 +174,7 @@ pub(crate) fn display_name(kind: &AgentKind, catalog: &AgentReadinessResult) -> 
         .into_iter()
         .find(|option| option.kind == *kind)
         .map(|option| option.display_name)
+        .or_else(|| diri_proto::agent_names::recognized_agent_name(kind.id()).map(str::to_owned))
         .unwrap_or_else(|| title_case_id(kind.id()))
 }
 
@@ -300,6 +301,84 @@ fn terminal_option() -> AgentOption {
     }
 }
 
+/// Splits the Settings "Arguments" field into argv elements the way a shell
+/// would read words: whitespace separates them, single and double quotes group
+/// them, and a backslash escapes the next character outside single quotes.
+/// Nothing is expanded; the Engine executes the words without a shell.
+/// `None` for an unterminated quote or trailing backslash.
+pub(crate) fn split_launch_args(text: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        ch => current.push(ch),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => match chars.next()? {
+                            escaped @ ('"' | '\\') => current.push(escaped),
+                            other => {
+                                current.push('\\');
+                                current.push(other);
+                            }
+                        },
+                        ch => current.push(ch),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                current.push(chars.next()?);
+            }
+            ch if ch.is_whitespace() => {
+                if in_word {
+                    args.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            ch => {
+                in_word = true;
+                current.push(ch);
+            }
+        }
+    }
+    if in_word {
+        args.push(current);
+    }
+    Some(args)
+}
+
+/// The inverse of [`split_launch_args`] for showing stored arguments.
+pub(crate) fn join_launch_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if !arg.is_empty()
+                && arg.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric()
+                        || matches!(ch, '-' | '_' | '=' | '.' | '/' | ':' | ',' | '@' | '+')
+                })
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn title_case_id(id: &str) -> String {
     id.split(['-', '_'])
         .filter(|part| !part.is_empty())
@@ -318,6 +397,23 @@ mod tests {
     use diri_proto::{AgentDescriptor, AgentReadinessItem, AgentSetup};
 
     use super::*;
+
+    #[test]
+    fn an_agent_known_only_by_name_keeps_its_brand_spelling() {
+        let catalog = AgentReadinessResult::default();
+        assert_eq!(
+            display_name(&AgentKind::new("traecli"), &catalog),
+            "TRAE CLI"
+        );
+        assert_eq!(
+            display_name(&AgentKind::new("codebuddy"), &catalog),
+            "CodeBuddy"
+        );
+        assert_eq!(
+            display_name(&AgentKind::new("some-cli"), &catalog),
+            "Some Cli"
+        );
+    }
 
     fn item(id: &str, available: bool, first_class: bool) -> AgentReadinessItem {
         AgentReadinessItem {
@@ -538,5 +634,39 @@ mod tests {
         assert_eq!(options[0].display_name, "Codex");
         assert!(!options[0].available);
         assert_eq!(options[0].setup_url, None);
+    }
+
+    #[test]
+    fn launch_args_split_like_shell_words_and_round_trip() {
+        assert_eq!(
+            split_launch_args("  --dangerously-skip-permissions --model opus ").unwrap(),
+            ["--dangerously-skip-permissions", "--model", "opus"]
+        );
+        assert_eq!(
+            split_launch_args(r#"--append-system-prompt "be terse; \"really\"" 'a b' c\ d "#)
+                .unwrap(),
+            [
+                "--append-system-prompt",
+                "be terse; \"really\"",
+                "a b",
+                "c d"
+            ]
+        );
+        assert!(split_launch_args("").unwrap().is_empty());
+        assert_eq!(split_launch_args("'open"), None);
+        assert_eq!(split_launch_args("\"open"), None);
+        assert_eq!(split_launch_args("trailing\\"), None);
+
+        let args = vec![
+            "--dangerously-skip-permissions".to_owned(),
+            "it's $(not) run".to_owned(),
+            "--model=opus".to_owned(),
+        ];
+        let shown = join_launch_args(&args);
+        assert_eq!(
+            shown,
+            r#"--dangerously-skip-permissions 'it'\''s $(not) run' --model=opus"#
+        );
+        assert_eq!(split_launch_args(&shown).unwrap(), args);
     }
 }

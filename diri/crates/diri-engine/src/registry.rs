@@ -152,7 +152,7 @@ pub(crate) struct CursorRefreshRequest {
 pub(crate) struct CursorRefreshResult {
     request: CursorRefreshRequest,
     conversation: Option<crate::history::CursorConversation>,
-    turn: Option<CursorTranscriptTurn>,
+    turn: Option<(CursorTranscriptTurn, u64)>,
 }
 
 /// Immutable input for a local provider-title refresh. Like Cursor metadata,
@@ -304,6 +304,7 @@ impl Registry {
                     .collect::<HashMap<_, _>>();
                 let mut locations = Vec::with_capacity(sessions.len());
                 let mut repaired = Vec::new();
+                let mut stray_worktree_projects = HashSet::new();
                 for mut record in sessions {
                     if let Some(home) = home
                         && repair_codex_conversation(&mut record, home)
@@ -318,16 +319,36 @@ impl Registry {
                     // Resolve the owning project before repairing its
                     // location namespace. In particular, a linked worktree's
                     // cwd is not its first-level project root.
-                    let project_root = project_roots
+                    let mut project_root = project_roots
                         .get(&record.project_id.0)
                         .cloned()
                         .unwrap_or_else(|| record.cwd.clone());
+                    if let Some(checkout) = remote_worktree_checkout(&record, &project_root) {
+                        stray_worktree_projects.insert(record.project_id.0.clone());
+                        project_root = checkout;
+                    }
                     record.project_id = session_project_id(&project_root, record.host.as_deref());
                     locations.push((project_root, record.host.clone()));
                     self.records.insert(record.id.0.clone(), record);
                 }
                 for (root, host) in locations {
                     self.ensure_session_project(&root, host.as_deref());
+                }
+                if !stray_worktree_projects.is_empty() {
+                    let owned = self
+                        .records
+                        .values()
+                        .map(|record| record.project_id.0.clone())
+                        .collect::<HashSet<_>>();
+                    self.projects.retain(|project| {
+                        project
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .is_none_or(|id| {
+                                !stray_worktree_projects.contains(id) || owned.contains(id)
+                            })
+                    });
+                    self.persist_now()?;
                 }
                 if let Some(home) = home {
                     repaired.extend(self.identify_unbound_codex(home));
@@ -1317,11 +1338,12 @@ impl Registry {
                     outcome.status_change.is_some() || outcome.turn_completed
                 };
                 status_changed = match turn {
-                    CursorTranscriptTurn::Working => {
-                        changed(session.feed_signal(StatusSignal::CursorTranscriptWorking))
-                    }
-                    CursorTranscriptTurn::Idle => {
-                        let idle = session.feed_signal(StatusSignal::CursorTranscriptIdle);
+                    (CursorTranscriptTurn::Working, bytes) => changed(
+                        session.feed_signal(StatusSignal::CursorTranscriptWorking { bytes }),
+                    ),
+                    (CursorTranscriptTurn::Idle, bytes) => {
+                        let idle =
+                            session.feed_signal(StatusSignal::CursorTranscriptIdle { bytes });
                         let tick = session.feed_signal(StatusSignal::Tick);
                         changed(idle) || changed(tick)
                     }
@@ -2645,6 +2667,12 @@ fn fold_shell_view(record: &mut SessionRecord, view: &SessionView) {
             normalize_terminal_title_for(title, agent, cwd)
         })
         .or_else(|| serving_title(record.foreground_ports.as_deref().unwrap_or_default()))
+        // An Agent known only by name is called that, not by its executable
+        // (`codebuddy-code`, `muse-bin-1.4.2`); a manifest's keeps the program.
+        .or_else(|| {
+            let agent = record.foreground_agent.as_ref()?;
+            diri_proto::agent_names::recognized_agent_name(agent.id()).map(str::to_owned)
+        })
         .or_else(|| view.foreground_program.clone())
         .or_else(|| record.terminal_cwd.as_deref().map(directory_title));
     if let Some(title) = title
@@ -3137,6 +3165,22 @@ fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
 
 fn not_found(id: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
+}
+
+/// The checkout a remote worktree Session belongs under, when an older
+/// Engine filed the worktree itself as the Session's project. Remote
+/// worktrees are created as `{checkout}-{branch slug}` (see
+/// `git::CREATE_WORKTREE_SCRIPT`), so the checkout is recoverable without
+/// reaching the host.
+fn remote_worktree_checkout(record: &SessionRecord, project_root: &str) -> Option<String> {
+    record.host.as_ref()?;
+    if record.worktree_path.as_deref() != Some(project_root) {
+        return None;
+    }
+    let slug = crate::git::branch_to_path_slug(record.git_branch.as_deref()?);
+    let checkout = project_root.strip_suffix(&format!("-{slug}"))?;
+    (!slug.is_empty() && checkout.starts_with('/') && checkout.len() > 1)
+        .then(|| checkout.to_owned())
 }
 
 /// Stable FNV-1a-shaped hash over a project location, truncated to 48 bits.
@@ -3644,6 +3688,72 @@ mod tests {
             1,
             "the repair must not leave a second project row behind"
         );
+    }
+
+    #[test]
+    fn loading_files_remote_worktrees_under_their_checkout() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut sessions = Vec::new();
+        let mut projects = Vec::new();
+        for (id, branch) in [("a", "slop/invite-flow"), ("b", "slop/trash-popover")] {
+            let path = format!(
+                "/home/me/code/anara-{}",
+                crate::git::branch_to_path_slug(branch)
+            );
+            let mut session = record(id);
+            session.host = Some("forge".into());
+            session.cwd = path.clone();
+            session.worktree_path = Some(path.clone());
+            session.git_branch = Some(branch.into());
+            session.project_id = session_project_id(&path, Some("forge"));
+            projects.push(serde_json::json!({
+                "id": session.project_id.0,
+                "root": path,
+                "name": "worktree",
+                "host": "forge",
+            }));
+            sessions.push(session);
+        }
+        // A plain remote session in a directory that merely ends in a dash
+        // keeps its own project.
+        let mut plain = record("plain");
+        plain.host = Some("forge".into());
+        plain.cwd = "/home/me/code/tool-main".into();
+        plain.git_branch = Some("main".into());
+        plain.project_id = session_project_id(&plain.cwd, Some("forge"));
+        projects.push(serde_json::json!({
+            "id": plain.project_id.0,
+            "root": plain.cwd,
+            "name": "tool-main",
+            "host": "forge",
+        }));
+        sessions.push(plain);
+        let state = PersistedState::current(sessions, projects);
+        std::fs::write(&state_file, serde_json::to_vec(&state).expect("encode")).expect("write");
+
+        let mut registry = Registry::new(engine(), &state_file);
+        registry.load().expect("load");
+        let checkout = session_project_id("/home/me/code/anara", Some("forge"));
+        let mut records = registry.records();
+        records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        assert_eq!(records[0].project_id, checkout);
+        assert_eq!(records[1].project_id, checkout);
+        assert_eq!(
+            records[2].project_id,
+            session_project_id("/home/me/code/tool-main", Some("forge"))
+        );
+        let mut roots = registry
+            .projects_raw()
+            .iter()
+            .map(|project| project["root"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        roots.sort();
+        assert_eq!(roots, ["/home/me/code/anara", "/home/me/code/tool-main"]);
+
+        let mut reloaded = Registry::new(engine(), &state_file);
+        reloaded.load().expect("reload");
+        assert_eq!(reloaded.projects_raw().len(), 2, "the repair is persisted");
     }
 
     #[test]
@@ -4567,6 +4677,15 @@ mod tests {
             ),
         );
         assert_eq!(shell.title, "Fix login redirect");
+
+        // An Agent known only by name: its display name, not its executable,
+        // until it titles the terminal itself.
+        fold_session_view(
+            &mut shell,
+            &view(Some("codebuddy-code"), Some("codebuddy"), None),
+        );
+        assert_eq!(shell.effective_kind(), &AgentKind::new("codebuddy"));
+        assert_eq!(shell.title, "CodeBuddy");
 
         fold_session_view(&mut shell, &view(None, None, None));
         assert_eq!(shell.foreground_agent, None);

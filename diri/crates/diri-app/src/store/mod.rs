@@ -23,6 +23,7 @@ use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
     ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
     SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    TerminalConfigureParams,
 };
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -38,8 +39,9 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    FileEditor, InspectorTab, NewAgentStart, Prefs, SavedWindow, SidebarGrouping, SidebarOrdering,
-    TabOrientation, UiLanguage, WindowMaterial, WindowMode, WindowPlacement,
+    FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs, SavedWindow,
+    SidebarGrouping, SidebarOrdering, TabOrientation, UiLanguage, WindowMaterial, WindowMode,
+    WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
@@ -207,6 +209,12 @@ pub enum StoreEffect {
         params: SessionSpawnParams,
         slot: usize,
     },
+    /// A shell for a new pane of a tab: the Engine spawns it and records its
+    /// place in the split tree in the same request.
+    SpawnPane {
+        params: SessionSpawnParams,
+        pane: diri_proto::workspace::SpawnPane,
+    },
     /// Wake the client's idempotent reconnect loop out of backoff.
     RetryConnection,
     /// `session.migrate` — move a Claude session between local and a host.
@@ -246,6 +254,7 @@ pub enum StoreEffect {
     ReopenLast,
     SetActive(bool),
     ConfigureGovernor(GovernorConfigureParams),
+    ConfigureTerminal(TerminalConfigureParams),
     /// T11 consumes this by closing and dropping the corresponding attachment.
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
@@ -356,6 +365,9 @@ pub struct SpawnOptions {
     /// the SAME repository as this session on the target host (matched by
     /// origin URL), falling back to `cwd` / defaultCwd when not cloned there.
     pub same_repo_as: Option<SessionId>,
+    /// A terminal that runs this argv instead of the login shell (an `ssh://`
+    /// link, a man page, an opened `.command` file). Local terminals only.
+    pub argv: Option<Vec<String>>,
 }
 
 /// Async resolution state for "the active session's repo on host X" — drives
@@ -433,6 +445,9 @@ pub struct SessionStore {
     directory_listing: Option<DirectoryListing>,
     prefs: Prefs,
     theme_preview: Option<String>,
+    /// The interface style the palette is showing while its row is
+    /// highlighted; like `theme_preview`, never persisted.
+    interface_style_preview: Option<InterfaceStyle>,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
     focused_window: Option<SpawnOwner>,
@@ -552,6 +567,7 @@ impl SessionStore {
                 directory_listing: None,
                 prefs,
                 theme_preview: None,
+                interface_style_preview: None,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
                 focused_window: None,
@@ -1052,6 +1068,9 @@ impl SessionStore {
     }
 
     pub fn auxiliary_terminal_for(&self, parent: &SessionId) -> Option<Arc<SessionRecord>> {
+        // A shell that is a pane of a tab belongs to that tab, not to the
+        // inspector's terminal.
+        let placed = self.placed_sessions();
         self.sessions
             .values()
             .filter(|session| {
@@ -1059,6 +1078,7 @@ impl SessionStore {
                     && is_auxiliary_terminal(session)
                     && !session.is_archived()
                     && !self.closing.contains(&session.id)
+                    && !placed.contains(&session.id)
             })
             .max_by(|left, right| {
                 left.created_at
@@ -1292,6 +1312,17 @@ impl SessionStore {
         });
     }
 
+    /// A link or file macOS sent diri that it will not open.
+    pub(crate) fn report_open_failure(&mut self, detail: String) {
+        self.last_action_failure = Some(ActionFailure {
+            title: crate::i18n::t("open_handler.failed_title").to_owned(),
+            detail,
+            retrying: false,
+            retry: None,
+        });
+        self.emit(StoreEffect::UiChanged);
+    }
+
     pub fn dismiss_action_failure(&mut self) {
         self.last_action_failure = None;
         self.emit(StoreEffect::UiChanged);
@@ -1346,6 +1377,22 @@ impl SessionStore {
         true
     }
 
+    /// The interface style on screen: the palette's preview, else the saved
+    /// one. The window material follows it, so a preview of a glass style
+    /// blurs the desktop for as long as the row stays highlighted.
+    pub fn interface_style(&self) -> InterfaceStyle {
+        self.interface_style_preview
+            .unwrap_or_else(|| self.prefs.interface_style())
+    }
+
+    pub fn preview_interface_style(&mut self, style: Option<InterfaceStyle>) -> bool {
+        if self.interface_style_preview == style {
+            return false;
+        }
+        self.interface_style_preview = style;
+        true
+    }
+
     pub fn update_preferences(&mut self, update: impl FnOnce(&mut Prefs)) -> io::Result<()> {
         // Preference edits are a tiny transaction: the UI must never observe
         // a mutation which failed to reach disk and will disappear on restart.
@@ -1361,6 +1408,7 @@ impl SessionStore {
         self.invalidate_projection();
         if matches!(self.daemon_state, DaemonState::Connected) {
             self.emit(StoreEffect::ConfigureGovernor(self.governor_settings()));
+            self.emit(StoreEffect::ConfigureTerminal(self.terminal_settings()));
         }
         Ok(())
     }
@@ -1599,6 +1647,12 @@ impl SessionStore {
                 .memory_hard_limit_gb
                 .saturating_mul(1024 * 1024 * 1024),
         )
+    }
+
+    pub fn terminal_settings(&self) -> TerminalConfigureParams {
+        TerminalConfigureParams {
+            shell_integration: self.prefs.terminal_shell_integration,
+        }
     }
 
     pub fn sidebar_projection(&mut self) -> Arc<SidebarProjection> {
@@ -2790,6 +2844,122 @@ impl SessionStore {
     /// primary session's execution context and is deliberately not selected:
     /// pane focus is local UI state, while sidebar selection remains on the
     /// owning agent.
+    /// Sessions some saved tab shows in a pane.
+    pub fn placed_sessions(&self) -> HashSet<SessionId> {
+        self.workspaces
+            .snapshot()
+            .map(diri_proto::workspace::WorkspaceSnapshot::open_session_ids)
+            .unwrap_or_default()
+    }
+
+    /// The session a pane belongs to in the sidebar: a pane shell's parent,
+    /// otherwise the session itself.
+    pub fn pane_owner(&self, session: &SessionId) -> SessionId {
+        self.sessions
+            .get(session)
+            .filter(|record| is_auxiliary_terminal(record))
+            .and_then(|record| record.parent.clone())
+            .unwrap_or_else(|| session.clone())
+    }
+
+    /// The tab that shows `owner`, as its sidebar row sums it up: how many
+    /// panes the tab has, and the pane shells (owned by `owner`) among them,
+    /// whose state the row folds into its own. None for a one-pane tab.
+    pub fn pane_group(&self, owner: &SessionId) -> Option<(usize, Vec<Arc<SessionRecord>>)> {
+        use diri_proto::workspace::LayoutNode;
+        fn leaves<'a>(node: &'a LayoutNode, out: &mut Vec<&'a SessionId>) {
+            match node {
+                LayoutNode::Pane { session_id, .. } => out.push(session_id),
+                LayoutNode::Split { first, second, .. } => {
+                    leaves(first, out);
+                    leaves(second, out);
+                }
+            }
+        }
+        let snapshot = self.workspaces.snapshot()?;
+        let mut panes = Vec::new();
+        for tab in snapshot.workspaces.iter().flat_map(|w| &w.tabs) {
+            if !matches!(tab.layout, LayoutNode::Split { .. }) {
+                continue;
+            }
+            panes.clear();
+            leaves(&tab.layout, &mut panes);
+            if panes.contains(&owner) {
+                let shells = panes
+                    .iter()
+                    .filter_map(|id| self.sessions.get(*id))
+                    .filter(|session| {
+                        session.parent.as_ref() == Some(owner) && is_auxiliary_terminal(session)
+                    })
+                    .cloned()
+                    .collect();
+                return Some((panes.len(), shells));
+            }
+        }
+        None
+    }
+
+    /// The newest running pane shell of `owner` that no tab shows: one
+    /// `⌘J` hid, kept alive so showing it again restores its scrollback.
+    pub fn hidden_pane_shell(&self, owner: &SessionId) -> Option<SessionId> {
+        let placed = self.placed_sessions();
+        self.sessions
+            .values()
+            .filter(|session| {
+                session.parent.as_ref() == Some(owner)
+                    && is_auxiliary_terminal(session)
+                    && !session.is_archived()
+                    && !self.closing.contains(&session.id)
+                    && !placed.contains(&session.id)
+                    && !matches!(session.status, SessionStatus::Exited(_))
+            })
+            .max_by(|left, right| left.created_at.0.total_cmp(&right.created_at.0))
+            .map(|session| session.id.clone())
+    }
+
+    /// A new shell pane next to the pane showing `source`: same host, and
+    /// the directory that pane's shell is in. It belongs to the tab's owner,
+    /// so the tab stays one sidebar row.
+    pub fn spawn_pane_shell(
+        &mut self,
+        source: &SessionId,
+        pane: diri_proto::workspace::SpawnPane,
+    ) -> bool {
+        let owner = self.pane_owner(source);
+        let Some(session) = self.sessions.get(source).cloned() else {
+            return false;
+        };
+        self.last_action_failure = None;
+        self.emit(StoreEffect::SpawnPane {
+            pane,
+            params: SessionSpawnParams {
+                appearance: None,
+                kind: AgentKind::SHELL,
+                cwd: session.cwd.clone(),
+                new_worktree: None,
+                worktree_branch: None,
+                worktree_base: None,
+                title: Some(AUXILIARY_TERMINAL_TITLE.to_owned()),
+                initial_prompt: None,
+                parent: Some(owner),
+                initial_cols: None,
+                initial_rows: None,
+                host: session.host.clone(),
+                account_profile_id: None,
+                same_repo_as: None,
+                // Where the pane's shell has `cd`'d to (local only).
+                start_directory: session
+                    .host
+                    .is_none()
+                    .then(|| session.terminal_cwd.clone())
+                    .flatten(),
+                note_id: None,
+                argv: None,
+            },
+        });
+        true
+    }
+
     pub fn spawn_auxiliary_terminal(&mut self, parent: SessionId) -> bool {
         self.spawn_auxiliary_terminal_slot(parent, 0)
     }
@@ -2826,6 +2996,7 @@ impl SessionStore {
                 same_repo_as: None,
                 start_directory: None,
                 note_id: None,
+                argv: None,
             },
         });
         true
@@ -2939,6 +3110,7 @@ impl SessionStore {
             same_repo_as: options.same_repo_as,
             start_directory,
             note_id: None,
+            argv: options.argv,
         }
     }
 
@@ -3389,6 +3561,7 @@ impl StoreRuntime {
     }
 
     pub fn start_default(client: Arc<DaemonClient>) -> io::Result<Self> {
+        crate::imported_themes::load_into_registry(&crate::imported_themes::default_dir());
         Self::start(client, Prefs::path())
     }
 
@@ -3397,6 +3570,7 @@ impl StoreRuntime {
     /// Engine off the GPUI thread; the supervisor starts the client exactly
     /// once after that authoritative decision finishes.
     pub(crate) fn start_default_deferred(client: Arc<DaemonClient>) -> io::Result<Self> {
+        crate::imported_themes::load_into_registry(&crate::imported_themes::default_dir());
         let (store, effects) = SessionStore::load(Prefs::path())?;
         Ok(Self::start_with_store(
             client,
@@ -3624,12 +3798,17 @@ impl StoreRuntime {
                             };
                             state_snapshots.send_replace(snapshot);
                         }
-                        let (active, governor) = {
+                        let (active, governor, terminal) = {
                             let store = state_store.read().expect("session store lock poisoned");
-                            (store.app_is_active, store.governor_settings())
+                            (
+                                store.app_is_active,
+                                store.governor_settings(),
+                                store.terminal_settings(),
+                            )
                         };
                         let _ = state_client.set_active(active).await;
                         let _ = state_client.configure_governor(governor).await;
+                        let _ = state_client.configure_terminal(terminal).await;
                         // Warm the default remote only after local catalog,
                         // session hydration and lifecycle state have completed.
                         // A slow SSH login can then never delay first paint.
@@ -3937,13 +4116,19 @@ async fn run_effects(
             }
             StoreEffect::SpawnAuxiliary { params, slot } => {
                 let parent = params.parent.clone().expect("auxiliary parent");
-                let result = client.spawn(params).await;
+                // The inspector shows this shell; it is not a pane.
+                let result = client
+                    .spawn_placed(params, diri_proto::workspace::SpawnPane::Detached)
+                    .await;
                 store.write().expect("store").finish_auxiliary_spawn(
                     parent,
                     slot,
                     result.as_ref().ok().cloned(),
                 );
                 result.map(|_| ())
+            }
+            StoreEffect::SpawnPane { params, pane } => {
+                client.spawn_placed(params, pane).await.map(|_| ())
             }
             StoreEffect::RetryConnection => {
                 client.retry_now();
@@ -4222,6 +4407,7 @@ async fn run_effects(
             },
             StoreEffect::SetActive(active) => client.set_active(active).await,
             StoreEffect::ConfigureGovernor(settings) => client.configure_governor(settings).await,
+            StoreEffect::ConfigureTerminal(settings) => client.configure_terminal(settings).await,
             StoreEffect::DetachAttachment(id) => {
                 let _ = detach_tx.send(id);
                 Ok(())
@@ -4281,7 +4467,9 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::Spawn(_) | StoreEffect::StartWorkItem { .. } => {
             ("Create session failed", None)
         }
-        StoreEffect::SpawnAuxiliary { .. } => ("Open terminal failed", None),
+        StoreEffect::SpawnAuxiliary { .. } | StoreEffect::SpawnPane { .. } => {
+            ("Open terminal failed", None)
+        }
         StoreEffect::Migrate { .. } => ("Move session failed", None),
         StoreEffect::ReparentWorktree(_) => ("Move session to worktree failed", None),
         StoreEffect::SyncPrefs { host, host_name } => (
@@ -4304,6 +4492,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::ListDirectories { .. }
         | StoreEffect::SetActive(_)
         | StoreEffect::ConfigureGovernor(_)
+        | StoreEffect::ConfigureTerminal(_)
         | StoreEffect::DetachAttachment(_)
         | StoreEffect::StatusTransition(_) => return None,
         // Catalog failures land in `agent_catalog_errors`, which the Agents

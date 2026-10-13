@@ -1,9 +1,7 @@
 mod groups;
 mod project_agents;
 use super::*;
-use diri_proto::workspace::{
-    DockEdge, PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord,
-};
+use diri_proto::workspace::{PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord};
 use groups::{WorkspaceRowKey, project_groups};
 use project_agents::{ProjectAgentOpen, first_agent, focused_agent};
 
@@ -47,11 +45,6 @@ pub(super) enum WorkspaceEditor {
 #[derive(Clone)]
 pub(super) enum SessionDestination {
     Tab(WorkspaceId),
-    Split {
-        tab: TabId,
-        pane: PaneId,
-        edge: DockEdge,
-    },
 }
 pub(super) struct WorkspaceNavigation {
     pub active: Option<WorkspaceId>,
@@ -314,23 +307,12 @@ impl Sidebar {
         cx.emit(SidebarEvent::WorkspaceActivated(id));
         cx.notify();
     }
-    pub(crate) fn choose_split_session(
-        &mut self,
-        tab: TabId,
-        pane: PaneId,
-        edge: DockEdge,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.workspace_nav.editor = None;
-        self.workspace_nav.destination = Some(SessionDestination::Split { tab, pane, edge });
-        self.workspace_nav.highlighted_session = None;
-        self.workspace_nav.menu = true;
-        self.workspace_nav.query.clear();
-        self.workspace_nav.focus.focus(window, cx);
-        self.peek(window, cx);
-        cx.notify();
+    /// Settles workspace navigation outside a render, for a store change
+    /// the sidebar would otherwise only see when it next paints.
+    pub(crate) fn settle_workspace_navigation(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_workspace_navigation(cx);
     }
+
     pub(super) fn reconcile_workspace_navigation(&mut self, cx: &mut Context<Self>) {
         self.reconcile_project_agent(cx);
         self.reconcile_workspace_activation(cx);
@@ -532,12 +514,6 @@ impl Sidebar {
                 workspace_id,
                 session_id: id,
                 title: None,
-            },
-            SessionDestination::Split { tab, pane, edge } => WorkspaceMutation::SplitPane {
-                tab_id: tab,
-                target: pane,
-                session_id: id,
-                edge,
             },
         };
         if self.store.write().expect("store").edit_workspace(mutation) {
@@ -1071,37 +1047,6 @@ impl Sidebar {
             .max_h(px(330.0))
             .overflow_y_scroll();
         if let Some(destination) = &self.workspace_nav.destination {
-            if let SessionDestination::Split { tab, pane, edge } = destination {
-                let right = *edge == DockEdge::Right;
-                let tab = tab.clone();
-                let pane = pane.clone();
-                panel = panel.child(
-                    div()
-                        .id("workspace-split-direction")
-                        .role(Role::Button)
-                        .aria_label(t("sidebar.workspace.split_direction"))
-                        .p(px(6.0))
-                        .cursor_pointer()
-                        .text_size(px(12.0))
-                        .child(if right {
-                            t("sidebar.workspace.side_by_side")
-                        } else {
-                            t("sidebar.workspace.top_bottom")
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.workspace_nav.destination = Some(SessionDestination::Split {
-                                tab: tab.clone(),
-                                pane: pane.clone(),
-                                edge: if right {
-                                    DockEdge::Bottom
-                                } else {
-                                    DockEdge::Right
-                                },
-                            });
-                            cx.notify();
-                        })),
-                );
-            }
             let sessions = session_choices(&store, &query);
             if self
                 .workspace_nav
@@ -1410,6 +1355,7 @@ impl Sidebar {
     pub(super) fn workspace_strip(
         &mut self,
         colors: SemanticColors,
+        trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.end_lift_if_released(cx);
@@ -1423,31 +1369,40 @@ impl Sidebar {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
-            .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
+            .h(px(self.tab_strip_height()))
             .w_full()
             .flex_none()
             .flex()
             .items_center()
             .relative()
-            .py(px(6.0))
+            .pt(px(
+                6.0 + self.tab_strip_height() - crate::tab_navigation::TAB_STRIP_HEIGHT
+            ))
+            .pb(px(6.0))
             .gap(px(0.0))
-            .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                92.0
-            } else {
-                10.0
-            }))
+            .pl(px(self.strip_leading_inset()))
             .pr(px(10.0))
+            // Comfortable: the island below is the edge, so no hairline.
+            .when(!self.islands(), |strip| {
+                strip.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .h(px(1.0))
+                        .bg(colors.primary.alpha(0.07)),
+                )
+            })
+            // Islands already paint this chrome; a second tint would darken it.
+            .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .child(
+                // A breath between the project control and the first tab.
                 div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .h(px(1.0))
-                    .bg(colors.primary.alpha(0.07)),
+                    .flex_none()
+                    .mr(px(diri_ui::Metrics::TOOLBAR_COMPACT_GAP + 2.0))
+                    .child(self.project_control(colors, cx)),
             )
-            .bg(colors.sidebar_surface())
-            .child(self.project_control(colors, cx))
             .child(self.workspace_rows(true, colors, cx))
             .child(
                 div()
@@ -1466,6 +1421,16 @@ impl Sidebar {
                         cx.stop_propagation();
                     })),
             )
+            .when_some(trailing, |strip, trailing| {
+                strip.child(
+                    div()
+                        .flex_none()
+                        .ml(px(6.0))
+                        .flex()
+                        .items_center()
+                        .child(trailing),
+                )
+            })
             .into_any_element()
     }
 }

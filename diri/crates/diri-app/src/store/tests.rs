@@ -1848,6 +1848,7 @@ fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
         kind: AgentKind::CLAUDE_CODE,
         executable_path: None,
         show_in_quick_create: false,
+        launch_args: None,
     });
     assert!(matches!(
         effects.try_recv(),
@@ -4095,4 +4096,193 @@ fn a_user_rename_outlives_its_tab_for_history() {
         titles.get("conversation").map(String::as_str),
         Some("Billing refactor")
     );
+}
+
+#[test]
+fn an_opened_link_runs_its_argv_in_a_local_terminal_even_with_a_remote_default() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("local", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs {
+            default_spawn_host: Some("forge".into()),
+            ..Prefs::default()
+        },
+    );
+    drain(&mut effects);
+
+    // What `RootView::open_external` sends for `ssh://me@host`.
+    store.spawn_shell(super::SpawnOptions {
+        cwd: Some("/Users/me".into()),
+        title: Some("ssh me@host".into()),
+        argv: Some(vec![
+            "/usr/bin/ssh".into(),
+            "-l".into(),
+            "me".into(),
+            "--".into(),
+            "host".into(),
+        ]),
+        ..super::SpawnOptions::default()
+    });
+
+    let params = match effects.try_recv() {
+        Ok(StoreEffect::Spawn(params)) => params,
+        other => panic!("expected spawn effect, got {other:?}"),
+    };
+    assert_eq!(params.kind, AgentKind::SHELL);
+    assert_eq!(params.host, None, "a link names a program on this Mac");
+    assert_eq!(params.cwd, "/Users/me");
+    assert_eq!(params.initial_prompt, None, "nothing is typed into a shell");
+    assert_eq!(
+        params.argv.as_deref(),
+        Some(&["/usr/bin/ssh", "-l", "me", "--", "host"].map(String::from)[..])
+    );
+}
+
+#[test]
+fn an_unopenable_link_is_reported_without_spawning() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.report_open_failure("bad host".into());
+    let failure = store.action_failure().expect("failure shown");
+    assert_eq!(failure.detail, "bad host");
+    assert!(!failure.can_retry());
+    assert!(!matches!(effects.try_recv(), Ok(StoreEffect::Spawn(_))));
+}
+
+mod split_panes {
+    use super::*;
+    use diri_proto::workspace::{
+        DockEdge, LayoutAxis, LayoutNode, PaneId, SpawnPane, SplitId, TabId, WorkspaceId,
+        WorkspaceRecord, WorkspaceSnapshot, WorkspaceTab,
+    };
+
+    fn pane_shell(value: &str, parent: &str, created: f64) -> SessionRecord {
+        let mut shell = session(value, "p", created);
+        shell.kind = AgentKind::SHELL;
+        shell.parent = Some(id(parent));
+        shell
+    }
+
+    fn leaf(pane: &str, session: &str) -> LayoutNode {
+        LayoutNode::Pane {
+            id: PaneId::new(pane),
+            session_id: id(session),
+        }
+    }
+
+    /// Agent "one" with "shown" docked below it; "hidden" runs unplaced.
+    fn split_store() -> (SessionStore, mpsc::UnboundedReceiver<StoreEffect>) {
+        let (mut store, effects) = hydrated(
+            vec![
+                session("one", "p", 1.0),
+                pane_shell("shown", "one", 2.0),
+                pane_shell("hidden", "one", 3.0),
+                session("two", "p", 4.0),
+            ],
+            vec![project("p", "Project")],
+            Prefs::default(),
+        );
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 1,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("w"),
+                name: "Project".into(),
+                selected_tab: Some(TabId::new("t")),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("t"),
+                    title: None,
+                    focused_pane: PaneId::new("agent"),
+                    zoomed_pane: None,
+                    layout: LayoutNode::Split {
+                        id: SplitId::new("s"),
+                        axis: LayoutAxis::Vertical,
+                        fraction: 0.6,
+                        first: Box::new(leaf("agent", "one")),
+                        second: Box::new(leaf("terminal", "shown")),
+                    },
+                }],
+            }],
+            ..Default::default()
+        });
+        (store, effects)
+    }
+
+    #[test]
+    fn a_pane_shell_belongs_to_its_parent_row() {
+        let (mut store, _) = split_store();
+        assert_eq!(store.pane_owner(&id("shown")), id("one"));
+        assert_eq!(store.pane_owner(&id("one")), id("one"));
+        assert_eq!(store.pane_owner(&id("two")), id("two"));
+        // One row per tab: pane shells never become rows.
+        let rows: Vec<_> = store
+            .sidebar_projection()
+            .projects
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .map(|row| row.id().0.clone())
+            .collect();
+        assert!(!rows.contains(&"shown".to_owned()) && !rows.contains(&"hidden".to_owned()));
+    }
+
+    #[test]
+    fn the_row_counts_its_tab_panes_and_folds_in_its_shells() {
+        let (store, _) = split_store();
+        let (panes, shells) = store.pane_group(&id("one")).unwrap();
+        assert_eq!(panes, 2);
+        assert_eq!(
+            shells.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![id("shown")]
+        );
+        assert!(store.pane_group(&id("two")).is_none());
+    }
+
+    #[test]
+    fn hidden_pane_shell_is_the_newest_running_unplaced_one() {
+        let (mut store, _) = split_store();
+        assert_eq!(store.hidden_pane_shell(&id("one")), Some(id("hidden")));
+        // The inspector terminal never adopts a shell a tab shows.
+        assert_eq!(
+            store
+                .auxiliary_terminal_for(&id("one"))
+                .map(|s| s.id.clone()),
+            Some(id("hidden"))
+        );
+        let mut exited = pane_shell("hidden", "one", 3.0);
+        exited.status = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(1),
+            signal: None,
+            system_restart: false,
+            interrupted: false,
+        });
+        store.upsert_session(exited);
+        assert_eq!(store.hidden_pane_shell(&id("one")), None);
+    }
+
+    #[test]
+    fn a_split_spawns_a_shell_owned_by_the_tab_in_the_panes_directory() {
+        let (mut store, mut effects) = split_store();
+        let mut shown = pane_shell("shown", "one", 2.0);
+        shown.terminal_cwd = Some("/work/p/crates".into());
+        store.upsert_session(shown);
+        drain(&mut effects);
+        let placement = SpawnPane::Beside {
+            tab_id: TabId::new("t"),
+            target: PaneId::new("terminal"),
+            edge: DockEdge::Right,
+        };
+        assert!(store.spawn_pane_shell(&id("shown"), placement.clone()));
+        let effects = drain(&mut effects);
+        let Some(StoreEffect::SpawnPane { params, pane }) = effects.first() else {
+            panic!("expected a pane spawn, got {effects:?}");
+        };
+        assert_eq!(*pane, placement);
+        assert_eq!(params.kind, AgentKind::SHELL);
+        // Split from a shell: the new pane still belongs to the agent's row.
+        assert_eq!(params.parent, Some(id("one")));
+        assert_eq!(params.start_directory.as_deref(), Some("/work/p/crates"));
+        assert_eq!(params.host, None);
+        // Selection stays on the tab's row.
+        assert_ne!(store.selected_session_id(), Some(&id("shown")));
+    }
 }

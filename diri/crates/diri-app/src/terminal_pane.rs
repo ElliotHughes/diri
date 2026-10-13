@@ -983,6 +983,10 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// The pane is a comfortable-density island: its fills round their outer
+    /// corners, because GPUI clips children to rectangles, not to the
+    /// island's rounded edge.
+    island_corners: bool,
     /// This frame's hold-⌘ hint opacity, sampled at render.
     held_hint: f32,
     /// The workbench hosts this pane's title-bar actions elsewhere (the
@@ -1249,6 +1253,7 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            island_corners: false,
             held_hint: 0.0,
             header_hidden: false,
             navigation: None,
@@ -1409,7 +1414,9 @@ impl TerminalPane {
                 element.set_text_input_enabled(true);
                 element
             } else {
-                TerminalElement::new(buffer)
+                let element = TerminalElement::new(buffer);
+                self.fetch_inline_images(&id, &element, cx);
+                element
             };
             let element = element
                 .font(mono)
@@ -1452,6 +1459,70 @@ impl TerminalPane {
                 },
             );
         }
+    }
+
+    /// Gives a new terminal's image cache its fetcher: a key the grid shows
+    /// for the first time is read from the Engine, decoded off the main
+    /// thread and painted. A remote session's come from its Holder through
+    /// the Engine; with a Holder from before `inline-images-v1` none are
+    /// placed, so the task just waits out the element.
+    fn fetch_inline_images(
+        &self,
+        id: &SessionId,
+        element: &TerminalElement,
+        cx: &mut Context<Self>,
+    ) {
+        let cache = element.inline_images();
+        let (requests, mut keys) = mpsc::unbounded_channel::<String>();
+        cache.set_requester(move |key| {
+            let _ = requests.send(key);
+        });
+        // The cache owns the sender; a strong cache here would keep the
+        // channel, and this task, alive forever.
+        let cache = Arc::downgrade(&cache);
+        let client = Arc::clone(self.runtime.client());
+        let tokio = self.tokio.clone();
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            while let Some(key) = keys.recv().await {
+                let read = {
+                    let (client, id, key) = (Arc::clone(&client), id.clone(), key.clone());
+                    tokio.spawn(async move { client.read_image(&id, &key).await })
+                };
+                let decoded = match read.await {
+                    Ok(Ok(image)) => cx
+                        .background_executor()
+                        .spawn(async move {
+                            diri_term::inline_images::decode(
+                                image.format,
+                                image.compressed,
+                                image.width,
+                                image.height,
+                                &image.data,
+                            )
+                        })
+                        .await
+                        .map_err(|_| "decode"),
+                    // Evicted or deleted since it was drawn, most often.
+                    Ok(Err(_)) | Err(_) => Err("read"),
+                };
+                let Some(cache) = cache.upgrade() else {
+                    return;
+                };
+                match decoded {
+                    Ok(image) => cache.insert(&key, image),
+                    Err(stage) => {
+                        diri_telemetry::debug_event!("terminal.image_unavailable", stage = stage);
+                        cache.fail(&key);
+                    }
+                }
+                drop(cache);
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     fn reconcile_store_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1768,6 +1839,13 @@ impl TerminalPane {
         cx.notify();
     }
 
+    pub fn set_island_corners(&mut self, island: bool, cx: &mut Context<Self>) {
+        if self.island_corners != island {
+            self.island_corners = island;
+            cx.notify();
+        }
+    }
+
     /// Drop the pane's own title bar because the workbench hosts its actions
     /// in the horizontal tab strip. Grid geometry follows on the next layout.
     pub fn set_header_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
@@ -1791,6 +1869,17 @@ impl TerminalPane {
     pub(crate) fn header_height(&self) -> f32 {
         if self.header_hidden {
             0.0
+        } else {
+            self.title_bar_height()
+        }
+    }
+
+    /// The pane's title bar. An island is inset by the gap at the top, so its
+    /// bar gives up the gap twice and stays centred on the window's toolbar
+    /// line, level with the traffic lights and the sidebar's buttons.
+    fn title_bar_height(&self) -> f32 {
+        if self.island_corners {
+            island_title_bar()
         } else {
             Metrics::TITLE_BAR
         }
@@ -4365,9 +4454,18 @@ impl TerminalPane {
 
     /// The top-left pane owns the native window-button lane when navigation
     /// chrome is hidden, including panes mounted by a saved split layout.
-    fn occupies_window_titlebar(&self) -> bool {
+    /// How far in from the window's left edge the pane starts when its
+    /// title bar shares the traffic lights' row: 0 when flush (compact),
+    /// the island gap in comfortable. `None` when the lights are elsewhere.
+    fn window_titlebar_inset(&self) -> Option<f32> {
+        // The lights start 20 pt in and are centred on the title bar.
         self.viewport
-            .is_some_and(|viewport| viewport.x < 0.5 && viewport.y < 0.5)
+            .filter(|viewport| viewport.x < 20.0 && viewport.y < Metrics::TITLE_BAR / 2.0)
+            .map(|viewport| viewport.x)
+    }
+
+    fn occupies_window_titlebar(&self) -> bool {
+        self.window_titlebar_inset().is_some()
     }
 
     fn shows_navigation_control(&self) -> bool {
@@ -4395,8 +4493,13 @@ impl TerminalPane {
             .gap(px(Metrics::TOOLBAR_ITEM_GAP))
             // The visible lights need more breathing room than their native
             // frames imply, so this is an intentional optical safe area.
-            .when(self.occupies_window_titlebar(), |control| {
-                control.child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
+            .when_some(self.window_titlebar_inset(), |control, inset| {
+                // Clear the lights at the same window x in every density.
+                control.child(
+                    div()
+                        .w(px((Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE - inset).max(0.0)))
+                        .flex_none(),
+                )
             })
             .child(crate::held_hints::below(
                 div()
@@ -4456,7 +4559,7 @@ impl TerminalPane {
             .viewport
             .map_or(f32::INFINITY, |viewport| viewport.width);
         div()
-            .h(px(Metrics::TITLE_BAR))
+            .h(px(self.title_bar_height()))
             .flex_none()
             .pl(px(Metrics::TOOLBAR_EDGE_INSET))
             .pr(px(Metrics::TOOLBAR_EDGE_INSET + header_trailing_inset))
@@ -4464,6 +4567,9 @@ impl TerminalPane {
             .items_center()
             .justify_between()
             .bg(colors.work_surface_nested())
+            .when(self.island_corners, |header| {
+                header.rounded_t(px(Radius::CARD))
+            })
             .child(
                 div()
                     .min_w(px(0.0))
@@ -4844,6 +4950,8 @@ impl TerminalPane {
                         ),
                     },
                 )
+                // Shell command marks sit in the grid's left padding.
+                .bleed_left(px(diri_term::element::COMMAND_MARK_GUTTER))
                 .size_full(),
             );
 
@@ -5424,6 +5532,7 @@ impl Render for TerminalPane {
                 .track_focus(&self.focus)
                 .size_full()
                 .bg(colors.terminal_surface())
+                .when(self.island_corners, |note| note.rounded(px(Radius::CARD)))
                 .child(pane)
                 .into_any_element();
         }
@@ -5469,8 +5578,11 @@ impl TerminalPane {
                 .flex_1()
                 .h_full()
                 .overflow_hidden()
-                .border_l_1()
-                .border_color(sidebar_colors.primary.alpha(0.08))
+                .when(!self.island_corners, |pane| {
+                    pane.border_l_1()
+                        .border_color(sidebar_colors.primary.alpha(0.08))
+                })
+                .when(self.island_corners, |pane| pane.rounded(px(Radius::CARD)))
                 .bg(colors.terminal_surface())
                 .when(!self.header_hidden, |pane| {
                     pane.child(self.render_header(&session, sidebar_colors, cx))
@@ -5481,10 +5593,15 @@ impl TerminalPane {
                 .flex_1()
                 .flex()
                 .flex_col()
-                .when(!self.header_hidden, |surface| {
+                .when(!self.header_hidden || self.island_corners, |surface| {
                     surface
                         .rounded_tl(px(Radius::CARD))
                         .rounded_tr(px(Radius::CARD))
+                })
+                .when(self.island_corners, |surface| {
+                    surface
+                        .rounded_bl(px(Radius::CARD))
+                        .rounded_br(px(Radius::CARD))
                 })
                 .overflow_hidden()
                 .bg(colors.work_surface_nested())
@@ -5522,10 +5639,11 @@ impl TerminalPane {
                 .flex()
                 .flex_col()
                 .bg(colors.terminal_surface())
+                .when(self.island_corners, |pane| pane.rounded(px(Radius::CARD)))
                 .when(has_header, |pane| {
                     pane.child(
                         div()
-                            .h(px(Metrics::TITLE_BAR))
+                            .h(px(self.title_bar_height()))
                             .flex_none()
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
                             .flex()
@@ -5594,6 +5712,12 @@ impl TerminalPane {
                     cx.stop_propagation();
                 }),
             )
+            .on_action(cx.listener(
+                |this, _: &crate::commands::CopyLastCommandOutput, window, cx| {
+                    this.copy_last_command_output(window, cx);
+                    cx.stop_propagation();
+                },
+            ))
             .on_action(
                 cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
                     this.read_terminal_history(Some(true), window, cx);
@@ -6028,7 +6152,7 @@ fn ui_agent_kind(kind: &ProtoAgentKind) -> UiAgentKind {
         ProtoAgentKind::CURSOR_ID => UiAgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => UiAgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => UiAgentKind::Shell,
-        _ => UiAgentKind::Generic,
+        id => UiAgentKind::from_agent_id(id),
     }
 }
 
@@ -6256,6 +6380,12 @@ impl diri_ui::ScrollTarget for TerminalScrollTarget {
     fn bounce_edges(&self) -> (bool, bool) {
         (true, false)
     }
+}
+
+/// Title bar height of a comfortable-density island; see
+/// [`TerminalPane::title_bar_height`].
+pub(crate) fn island_title_bar() -> f32 {
+    Metrics::TITLE_BAR - 2.0 * crate::store::PaneDensity::Comfortable.island_gap()
 }
 
 #[cfg(test)]
@@ -7660,6 +7790,33 @@ mod tests {
                         ).as_bytes());
                         grid = screen.full_snapshot();
                     }
+                    if scene.starts_with("commands") {
+                        // A shell with OSC 133 marks: two commands that
+                        // passed, one that failed, and one still running.
+                        let mut screen = diri_engine::HeadlessScreen::new(80, 16);
+                        let run = |command: &str, output: &str, status: u8| {
+                            format!(
+                                "\x1b]133;A\x07\x1b[36m~/work/diri\x1b[0m $ \x1b]133;B\x07{command}\r\n\
+                                 \x1b]133;C\x07{output}\x1b]133;D;{status}\x07"
+                            )
+                        };
+                        screen.feed(run("ls", "Cargo.toml  README.md  crates  docs\r\n", 0).as_bytes());
+                        screen.feed(run(
+                            "cargo test -p diri-term command_marks",
+                            "running 3 tests\r\ntest a_prompt_shows_how_its_own_command_ended ... ok\r\n\
+                             test command_output_runs_from_its_output_mark_to_its_end ... ok\r\n\
+                             test the_last_finished_output_is_kept_while_reading_forward ... ok\r\n\r\n\
+                             test result: \x1b[32mok\x1b[0m. 3 passed; 0 failed\r\n",
+                            0,
+                        ).as_bytes());
+                        screen.feed(run(
+                            "git push origin HEAD",
+                            "\x1b[31merror:\x1b[0m failed to push some refs to 'origin'\r\n",
+                            1,
+                        ).as_bytes());
+                        screen.feed(b"\x1b]133;A\x07\x1b[36m~/work/diri\x1b[0m $ \x1b]133;B\x07sleep 5\r\n\x1b]133;C\x07");
+                        grid = screen.full_snapshot();
+                    }
                     let find_fixture = if scene == "find-unicode" {
                         let mut screen = diri_engine::HeadlessScreen::new(80, 28);
                         screen.feed("$ printf 'Unicode terminal output'\r\n\r\n1  <界> cafe\u{301}\r\n2  A🙂B  cafe\u{301}\r\n\r\nSearch keeps wide glyphs and combining marks aligned with their cells.".as_bytes());
@@ -7766,6 +7923,18 @@ mod tests {
                                 cx,
                             );
                         }
+                        "commands-select" => {
+                            let resident = pane.residents.get(&id).unwrap();
+                            let output = resident.element.command_output_at(10, 4).unwrap();
+                            resident.element.select_range(output.start, output.end);
+                        }
+                        "commands-menu" => pane.open_terminal_menu(
+                            gpui::point(px(220.0), px(110.0)),
+                            10,
+                            4,
+                            window,
+                            cx,
+                        ),
                         "menu" => pane.open_terminal_menu(
                             gpui::point(px(260.0), px(180.0)),
                             2,

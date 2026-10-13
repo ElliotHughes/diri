@@ -14,6 +14,7 @@ mod titles;
 mod windowing;
 mod workspaces;
 
+pub(crate) use accounts::AccountRequest;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use titles::testing as title_clock_for_test;
 
@@ -217,7 +218,7 @@ pub(crate) enum SidebarEvent {
     /// Root-mounted header popup visibility changed; no sidebar layout change.
     ProjectPickerChanged,
     RefreshUsageLimits,
-    AccountAction(Option<String>),
+    AccountAction(AccountRequest),
     ManageAccounts,
     ContinueAccount(SessionId),
     VisibilityChanged,
@@ -3729,6 +3730,7 @@ impl Sidebar {
             ref drag_selection,
             migrating,
             activity_state,
+            panes,
             progress,
             marked,
             hovered,
@@ -3770,6 +3772,11 @@ impl Sidebar {
             !hovered && focused && shortcut.is_some(),
         ) - if loading { 60.0 } else { 0.0 }
             - if scheduled_run.is_some() { 18.0 } else { 0.0 }
+            - if panes > 1 {
+                PANE_COUNT_WIDTH + 8.0
+            } else {
+                0.0
+            }
             - if row.has_children {
                 SIDEBAR_TRAILING_SLOT + 8.0
             } else {
@@ -4145,6 +4152,10 @@ impl Sidebar {
             .when(remote_marked, |element| {
                 // This session's agent runs on another machine.
                 element.child(remote_mark(colors))
+            })
+            .when(panes > 1, |element| {
+                // A split tab is still one row; this says how many panes.
+                element.child(pane_count_mark(&id, panes, colors))
             })
             .when_some(lineage, |element, role| {
                 element.child(lineage_glyph(&id, role, colors))
@@ -4845,7 +4856,7 @@ impl Sidebar {
                         };
                         if !this.preview && this.ui.popover == Some(Popover::Account) {
                             cx.emit(SidebarEvent::RefreshUsageLimits);
-                            cx.emit(SidebarEvent::AccountAction(None));
+                            cx.emit(SidebarEvent::AccountAction(AccountRequest::Refresh));
                         }
                         cx.notify();
                     }))
@@ -6359,7 +6370,11 @@ impl Sidebar {
             .child(menu_divider(colors))
             .child(self.account_switch_menu(colors, cx))
             .child(menu_divider(colors))
-            .child(account_limits_menu(&limits, colors))
+            .child(account_limits_menu(
+                &limits,
+                !self.preview && !self.accounts_loaded(),
+                colors,
+            ))
             .child(menu_divider(colors))
             .child(account_action_row(
                 "account-settings",
@@ -8825,7 +8840,14 @@ impl Sidebar {
             self.request_motion_frame(window, cx);
         }
         // Paint the edge without reducing the shared sidebar content width.
-        root = root.when(!self.surface_in_parent, |root| {
+        let islands = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density
+            .islands();
+        root = root.when(!self.surface_in_parent && !islands, |root| {
             root.child(
                 div()
                     .absolute()
@@ -9129,6 +9151,34 @@ fn archive_count(count: usize, colors: SemanticColors) -> AnyElement {
 /// rather than the host's name: the name repeated down a whole project reads
 /// as a wall of chips, while one small server mark says "not this machine"
 /// without competing with the titles.
+const PANE_COUNT_WIDTH: f32 = 24.0;
+
+/// A split tab's pane count: a quiet two-column glyph and the number.
+fn pane_count_mark(id: &SessionId, panes: usize, colors: SemanticColors) -> AnyElement {
+    div()
+        .debug_selector({
+            let id = id.clone();
+            move || format!("session-panes:{}", id.0)
+        })
+        .id(format!("session-panes:{}", id.0))
+        .role(Role::Image)
+        .aria_label(tf("session.pane_count", &[("count", &panes)]))
+        .flex_none()
+        .w(px(PANE_COUNT_WIDTH))
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(2.0))
+        .child(sf_symbol("rectangle.split.2x1", 9.0, colors.tertiary))
+        .child(
+            div()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(panes.to_string()),
+        )
+        .into_any_element()
+}
+
 fn remote_mark(colors: SemanticColors) -> AnyElement {
     div()
         .debug_selector(|| "remote-mark".to_owned())
@@ -9418,6 +9468,7 @@ const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
 /// when the menu opens, so there is no control here.
 fn account_limits_menu(
     limits: &[crate::usage::limits::AccountLimits],
+    loading: bool,
     colors: SemanticColors,
 ) -> AnyElement {
     let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
@@ -9428,10 +9479,12 @@ fn account_limits_menu(
         .flex()
         .flex_col()
         .py(px(3.0));
-    if limits.is_empty() {
+    // Every window of the logins in use; each account row above shows its tightest.
+    let live: Vec<_> = limits.iter().filter(|account| account.live).collect();
+    if live.is_empty() && loading {
         section = section.child(menu_note(t("sidebar.account.checking_limits"), colors));
     }
-    for account in limits {
+    for account in live {
         for (index, limit) in account.windows.iter().enumerate() {
             let expired = limit.resets_at.is_some_and(|reset| reset <= now);
             let stale = expired || account.error.is_some() || now - account.checked_at > 360;
@@ -11966,7 +12019,7 @@ mod tests {
                 sidebar
             });
             cx.subscribe(&sidebar, move |_, _, event: &SidebarEvent, _| {
-                if let SidebarEvent::AccountAction(Some(id)) = event {
+                if let SidebarEvent::AccountAction(AccountRequest::Switch(id)) = event {
                     observed.borrow_mut().push(id.clone());
                 }
             })
@@ -11986,6 +12039,64 @@ mod tests {
         assert!(
             cx.debug_bounds("account-menu").is_some(),
             "switch stays in menu"
+        );
+    }
+
+    #[gpui::test]
+    fn account_menu_stays_one_line_per_account(cx: &mut TestAppContext) {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let observed = requests.clone();
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.ui.popover = Some(Popover::Account);
+                // Side project was never signed in; Codex also runs on a
+                // login no profile holds yet.
+                let overview = sidebar.accounts.overview_mut();
+                overview.logins[3].signed_in = false;
+                overview.live[1].profile_id = None;
+                sidebar
+            });
+            cx.subscribe(&sidebar, move |_, _, event: &SidebarEvent, _| {
+                if let SidebarEvent::AccountAction(request) = event {
+                    observed.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+            SidebarPopoverHarness { sidebar }
+        });
+        let click = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            let target = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(target.center(), Modifiers::default());
+        };
+
+        click(cx, "switch-account-preview-0");
+        assert!(
+            requests.borrow().is_empty(),
+            "the account in use is already live"
+        );
+        click(cx, "switch-account-preview-1");
+        click(cx, "switch-account-preview-3");
+        assert_eq!(
+            *requests.borrow(),
+            vec![
+                AccountRequest::Switch("preview-1".into()),
+                AccountRequest::SignIn("preview-3".into()),
+            ]
+        );
+        // Saving and adding accounts live in Settings, not here.
+        for selector in ["add-account", "save-account-codex", "unsaved-account-codex"] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} is not in the menu"
+            );
+        }
+        assert!(cx.debug_bounds("manage-accounts").is_some());
+        assert!(
+            cx.debug_bounds("account-menu").is_some(),
+            "the menu stays open"
         );
     }
 
@@ -12523,6 +12634,37 @@ mod tests {
                         asking.updated_at = diri_proto::DateMillis(now);
                         store.upsert_session(asking);
                     }
+                    // `DIRI_VISUAL_REMOTE_WORKTREES=1` replaces the fixture
+                    // with remote worktree Sessions an older Engine filed as
+                    // one project each, loaded through this build's Engine.
+                    if std::env::var_os("DIRI_VISUAL_REMOTE_WORKTREES").is_some() {
+                        let dir = tempfile::tempdir().expect("state dir");
+                        let state = dir.path().join("state.json");
+                        std::fs::write(
+                            &state,
+                            serde_json::to_vec(&crate::sidebar::fixture::remote_worktree_state())
+                                .expect("encode state"),
+                        )
+                        .expect("write state");
+                        let engine = Arc::new(diri_engine::ManifestEngine::new(Vec::new()));
+                        let mut registry = diri_engine::registry::Registry::new(engine, &state);
+                        registry.load().expect("load state");
+                        let mut sessions = registry.records();
+                        for session in &mut sessions {
+                            session.updated_at = diri_proto::DateMillis(now);
+                        }
+                        store.hydrate(diri_proto::SessionListResult {
+                            projects: registry
+                                .projects_raw()
+                                .iter()
+                                .map(|project| {
+                                    serde_json::from_value(project.clone()).expect("project")
+                                })
+                                .collect(),
+                            sessions,
+                        });
+                        store.select(SessionId::new("preview-slop-0"));
+                    }
                     store
                         .update_preferences(|prefs| {
                             prefs.terminal_theme = if light {
@@ -12936,6 +13078,7 @@ mod tests {
                         configured_path: None,
                         path_source: Some(diri_proto::AgentPathSource::SystemPath),
                         show_in_quick_create: true,
+                        launch_args: Vec::new(),
                         error: None,
                         signed_in: None,
                         descriptor: Some(diri_proto::AgentDescriptor {

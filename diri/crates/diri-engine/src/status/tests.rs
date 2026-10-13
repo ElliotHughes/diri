@@ -25,6 +25,8 @@ fn observation(state: ManifestState, seq: u64) -> ScreenObservation {
         content_seq: seq,
         prompt_excerpt: None,
         options: None,
+        stale_after_submit: false,
+        turn_started: false,
     }
 }
 
@@ -125,6 +127,8 @@ fn blocker(seq: u64, excerpt: &str) -> ScreenObservation {
         content_seq: seq,
         prompt_excerpt: Some(excerpt.into()),
         options: Some(vec!["Yes".into(), "No".into()]),
+        stale_after_submit: false,
+        turn_started: false,
     }
 }
 
@@ -690,6 +694,111 @@ fn a_shell_lends_its_status_to_an_agent_in_its_foreground() {
     assert_eq!(outcome.status_change, Some(SessionStatus::Working));
 }
 
+/// Streams output every 100 ms from `from` for `span`, then ticks; returns
+/// the time of the last frame and whether any reduction finished a turn.
+fn stream(reducer: &mut StatusReducer, from: SystemTime, span: Duration) -> (SystemTime, bool) {
+    let mut at = from;
+    let mut completed = false;
+    while at < from + span {
+        completed |= reducer
+            .reduce(StatusSignal::PtyOutputActivity, at)
+            .turn_completed;
+        completed |= reducer.reduce(StatusSignal::Tick, at).turn_completed;
+        at += Duration::from_millis(100);
+    }
+    (at, completed)
+}
+
+/// An Agent the catalog knows only by name (`goose`) has no screen rules:
+/// while it holds the shell's foreground, sustained output is Working and a
+/// still terminal is Idle. A turn the user asked for ends with an
+/// announcement; being recognised, or redrawing on its own, does not.
+#[test]
+fn an_agent_known_by_name_is_read_from_its_output() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    let outcome = reducer.lend_to_activity("goose", now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert_eq!(reducer.foreground_agent(), Some("goose"));
+    assert_eq!(
+        reducer.lend_to_activity("goose", now),
+        ReducerOutcome::default()
+    );
+
+    // Its banner and composer paint in one short burst: not work.
+    let (at, _) = stream(&mut reducer, now, Duration::from_millis(300));
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Typing echoes; that is not work either, however long it goes on.
+    let mut at = at + Duration::from_secs(5);
+    for _ in 0..20 {
+        reducer.reduce(StatusSignal::UserKeystroke, at);
+        reducer.reduce(
+            StatusSignal::PtyOutputActivity,
+            at + Duration::from_millis(20),
+        );
+        at += Duration::from_millis(100);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Enter, then a reply streams: Working, then Idle with an announcement.
+    reducer.reduce(StatusSignal::UserSubmission, at);
+    let (at, completed) = stream(
+        &mut reducer,
+        at + Duration::from_millis(300),
+        Duration::from_secs(4),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(!completed);
+    // A silent wait between chunks keeps it Working.
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(2));
+    assert_eq!(outcome.status_change, None);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(3));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed, "the turn the user asked for ends");
+    let evidence = reducer.evidence().expect("evidence");
+    assert_eq!(evidence.manifest_id.as_deref(), Some("goose"));
+    assert_eq!(evidence.status, SessionStatus::Idle);
+
+    // Output nobody asked for (a background refresh) is work, not a turn.
+    let at = at + Duration::from_secs(10);
+    let (at, _) = stream(&mut reducer, at, Duration::from_secs(1));
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(4));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    // Leaving hands the shell back its job tracking.
+    reducer.return_from_agent(false, at + Duration::from_secs(5));
+    assert_eq!(reducer.foreground_agent(), None);
+    assert_eq!(reducer.authority(), Authority::ProcessOnly);
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: true },
+        at + Duration::from_secs(6),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// An Agent with screen rules recognised after one read by its output (a
+/// new job in the same shell) is read by its rules, not by its output.
+#[test]
+fn a_screen_agent_replaces_an_activity_reading() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.lend_to_activity("goose", now);
+    reducer.lend_to_agent("kimi", Some("1"), now);
+    assert_eq!(reducer.foreground_agent(), Some("kimi"));
+    let (_, _) = stream(&mut reducer, now, Duration::from_secs(2));
+    assert_eq!(
+        reducer.status(),
+        &SessionStatus::Idle,
+        "bytes alone are not a screen Agent's work"
+    );
+}
+
 fn shell_running_a_job(now: SystemTime) -> StatusReducer {
     let mut reducer =
         StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
@@ -986,7 +1095,7 @@ fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
         now,
     );
     now += Duration::from_millis(100);
-    reducer.reduce(StatusSignal::CursorTranscriptIdle, now);
+    reducer.reduce(StatusSignal::CursorTranscriptIdle { bytes: 100 }, now);
     now += Duration::from_millis(100);
     let still_working = reducer.reduce(
         StatusSignal::Screen(observation(ManifestState::Working, 2)),
@@ -1009,7 +1118,7 @@ fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
     assert_eq!(*reducer.status(), SessionStatus::Idle);
 
     now += Duration::from_millis(100);
-    reducer.reduce(StatusSignal::CursorTranscriptWorking, now);
+    reducer.reduce(StatusSignal::CursorTranscriptWorking { bytes: 200 }, now);
     assert_eq!(*reducer.status(), SessionStatus::Working);
 }
 
@@ -1301,15 +1410,211 @@ fn a_reappearing_blocker_cancels_the_quiet_idle_frame() {
     assert!(matches!(reducer.status(), SessionStatus::NeedsInput(_)));
 }
 
+/// Cursor's composer after Enter: the previous turn's follow-up arrow.
+fn submit_chrome(seq: u64) -> ScreenObservation {
+    ScreenObservation {
+        matched_rule_id: "idle-prompt-arrow".into(),
+        stale_after_submit: true,
+        ..observation(ManifestState::Idle, seq)
+    }
+}
+
+/// Cursor's Generating/Thinking line.
+fn turn_started(seq: u64) -> ScreenObservation {
+    ScreenObservation {
+        matched_rule_id: "working-status-line".into(),
+        turn_started: true,
+        ..observation(ManifestState::Working, seq)
+    }
+}
+
+/// A Cursor reducer that has finished one turn (transcript at 100 bytes) and
+/// just had the next prompt submitted at the returned time.
+fn cursor_submitted() -> (StatusReducer, SystemTime) {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0())
+        .with_manifest("cursor", Some("2026.10.01"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(StatusSignal::Screen(turn_started(1)), now);
+    reducer.reduce(
+        StatusSignal::CursorTranscriptWorking { bytes: 100 },
+        now + Duration::from_millis(10),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let submitted = now + Duration::from_millis(50);
+    reducer.reduce(StatusSignal::UserSubmission, submitted);
+    (reducer, submitted)
+}
+
+/// Submitting and leaving Diri used to post "Cursor finished" or "needs you"
+/// while the agent was still working. cursor-agent 2026.10.01-14929f9 keeps
+/// the follow-up arrow up until Generating/Thinking paints, and the transcript
+/// tail can still be the previous turn.
+#[test]
+fn cursor_follow_up_arrow_after_submit_does_not_finish_or_ask() {
+    let (mut reducer, submitted) = cursor_submitted();
+
+    let arrow_at = submitted + Duration::from_millis(20);
+    let outcome = reducer.reduce(StatusSignal::Screen(submit_chrome(2)), arrow_at);
+    assert!(outcome.needs_input.is_none());
+    assert!(!outcome.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+
+    let stale = reducer.reduce(
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
+        arrow_at + Duration::from_millis(10),
+    );
+    assert!(!stale.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+
+    let tick = reducer.reduce(StatusSignal::Tick, arrow_at + Duration::from_millis(800));
+    assert!(
+        !tick.turn_completed,
+        "leftover follow-up chrome must not finish the turn"
+    );
+    assert!(tick.needs_input.is_none());
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+}
+
+#[test]
+fn cursor_ready_title_blocker_and_later_idle_still_notify_after_submit() {
+    // A Ready title is not composer chrome.
+    let (mut ready, at) = cursor_submitted();
+    ready.reduce(
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(10),
+    );
+    let title = ScreenObservation {
+        matched_rule_id: "idle-osc-title".into(),
+        ..observation(ManifestState::Idle, 3)
+    };
+    ready.reduce(StatusSignal::Screen(title), at + Duration::from_millis(20));
+    let finished = ready.reduce(StatusSignal::Tick, at + Duration::from_millis(800));
+    assert_eq!(ready.status(), &SessionStatus::Idle);
+    assert!(finished.turn_completed);
+
+    let (mut blocked, at) = cursor_submitted();
+    let outcome = blocked.reduce(
+        StatusSignal::Screen(blocker(2, "Run this command?")),
+        at + Duration::from_millis(10),
+    );
+    assert!(matches!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(_))
+    ));
+    assert!(outcome.needs_input.is_some());
+
+    // The transcript grew past the submit: this turn's own end.
+    let (mut transcript, at) = cursor_submitted();
+    transcript.reduce(
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
+        at + Duration::from_millis(10),
+    );
+    assert_eq!(transcript.status(), &SessionStatus::Working);
+    transcript.reduce(
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(20),
+    );
+    let ended = transcript.reduce(
+        StatusSignal::CursorTranscriptIdle { bytes: 180 },
+        at + Duration::from_millis(30),
+    );
+    let finished = transcript.reduce(StatusSignal::Tick, at + Duration::from_millis(140));
+    assert_eq!(transcript.status(), &SessionStatus::Idle);
+    assert!(ended.turn_completed || finished.turn_completed);
+
+    let (mut later, at) = cursor_submitted();
+    later.reduce(
+        StatusSignal::Screen(turn_started(2)),
+        at + Duration::from_millis(10),
+    );
+    later.reduce(
+        StatusSignal::Screen(submit_chrome(3)),
+        at + Duration::from_millis(20),
+    );
+    let finished = later.reduce(StatusSignal::Tick, at + Duration::from_millis(800));
+    assert_eq!(later.status(), &SessionStatus::Idle);
+    assert!(finished.turn_completed);
+}
+
+/// Rejecting a permission prompt raised before any Generating frame returns
+/// to the follow-up arrow. That must clear the blocker, not hold it forever.
+#[test]
+fn cursor_blocker_dismissed_after_submit_returns_to_idle() {
+    let (mut reducer, at) = cursor_submitted();
+    reducer.reduce(
+        StatusSignal::Screen(blocker(2, "Run this command?")),
+        at + Duration::from_millis(10),
+    );
+    assert!(matches!(reducer.status(), SessionStatus::NeedsInput(_)));
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(3)),
+        at + Duration::from_millis(20),
+    );
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(4)),
+        at + Duration::from_millis(30),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+}
+
+/// A reply too quick to show Generating or a working transcript still ends,
+/// once the submit hold runs out, from the arrow it leaves on screen.
+#[test]
+fn cursor_turn_without_working_evidence_ends_after_the_submit_hold() {
+    let (mut reducer, at) = cursor_submitted();
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(10),
+    );
+    let hold = ReducerTiming::default().submit_chrome_hold;
+    let mut now = at + Duration::from_millis(20);
+    while now < at + hold {
+        let outcome = reducer.reduce(StatusSignal::Tick, now);
+        assert!(!outcome.turn_completed);
+        now += Duration::from_millis(500);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let mut completed = false;
+    for _ in 0..4 {
+        completed |= reducer.reduce(StatusSignal::Tick, now).turn_completed;
+        now += Duration::from_millis(500);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(completed);
+}
+
+/// Agents whose rules carry no `stale_after_submit` flag are unaffected.
+#[test]
+fn submit_chrome_hold_needs_the_rule_flag() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("8"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    reducer.reduce(
+        StatusSignal::UserSubmission,
+        now + Duration::from_millis(10),
+    );
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 2)),
+        now + Duration::from_millis(20),
+    );
+    let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(800));
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(outcome.turn_completed);
+}
+
 #[test]
 fn cursor_transcript_cannot_finish_a_live_spinner() {
     let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
     let now = settled(&mut reducer, t0());
     let mut working = observation(ManifestState::Working, 1);
-    working.matched_rule_id = "working-status-line".into();
+    working.turn_started = true;
     reducer.reduce(StatusSignal::Screen(working), now);
     reducer.reduce(
-        StatusSignal::CursorTranscriptIdle,
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
         now + Duration::from_millis(100),
     );
     let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(1));

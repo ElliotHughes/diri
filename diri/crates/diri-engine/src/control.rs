@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
 mod account_handoff;
+mod account_overview;
 mod account_switch;
 mod agent_relaunch;
 mod agent_sign_in;
@@ -80,6 +81,20 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
     Method::SESSION_MIGRATE,
     Method::SESSION_CONTINUE_ACCOUNT,
 ];
+/// The last `terminal.configure`, in the config directory, so terminals the
+/// Engine starts before the app connects follow it too.
+const TERMINAL_SETTINGS_FILE: &str = "terminal.json";
+
+/// Missing or unreadable settings are the defaults: integration on.
+fn terminal_settings(config_dir: &Path) -> diri_proto::TerminalConfigureParams {
+    std::fs::read(config_dir.join(TERMINAL_SETTINGS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(diri_proto::TerminalConfigureParams {
+            shell_integration: true,
+        })
+}
+
 /// A terminal's shell: the user's own, as a login shell.
 fn login_shell_argv() -> Vec<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
@@ -116,6 +131,9 @@ pub struct ControlServer {
     attach: crate::attach::AttachHub,
     pr_monitor_wake: crate::pr_monitor::PrMonitorWake,
     injection: Option<InjectionConfig>,
+    /// The zsh/bash OSC 133 scripts, installed beside the injection files.
+    /// `terminal.configure` can switch them off (see [`TERMINAL_SETTINGS_FILE`]).
+    shell_integration: Option<crate::shell_integration::ShellIntegration>,
     /// The Engine-served MCP endpoint, once [`ControlServer::start_mcp_http`]
     /// bound it. Unset means every Agent keeps the stdio `dirijor-mcp`.
     mcp_http: std::sync::OnceLock<crate::mcp_http::McpHttpEndpoint>,
@@ -186,6 +204,14 @@ fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path
 }
 
 impl ControlServer {
+    /// One-time, at Engine start: pre-split `⌘J` terminals become panes of
+    /// their parent's tab. Later starts only read the marker.
+    pub fn adopt_pane_shells(&self) {
+        let records = self.registry.lock().expect("registry").records();
+        self.workspaces
+            .adopt_pane_shells(&live_pane_shells(&records));
+    }
+
     /// Configure private power endpoints before starting the scheduler.
     pub fn with_schedule_power(mut self, config: crate::wake::PowerConfig) -> Self {
         Arc::get_mut(&mut self.scheduler)
@@ -237,6 +263,7 @@ impl ControlServer {
             attach: crate::attach::AttachHub::new(),
             pr_monitor_wake: crate::pr_monitor::PrMonitorWake::default(),
             injection: None,
+            shell_integration: None,
             mcp_http: std::sync::OnceLock::new(),
             cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
@@ -264,8 +291,35 @@ impl ControlServer {
         let _ = crate::inject::write_claude_hooks_file(&config.inject_dir);
         let _ = crate::inject::write_claude_mcp_file(&config.inject_dir, &config.cli_path);
         let _ = crate::inject::write_claude_skills_plugin(&config.inject_dir);
+        match crate::shell_integration::ShellIntegration::install(&config.inject_dir) {
+            Ok(integration) => self.shell_integration = Some(integration),
+            Err(error) => eprintln!("diri-engine: shell integration unavailable: {error}"),
+        }
         self.injection = Some(config);
         self
+    }
+
+    /// The shell integration a new local terminal gets: `None` when it is
+    /// not installed or the user switched it off.
+    fn terminal_shell_integration(&self) -> Option<&crate::shell_integration::ShellIntegration> {
+        let integration = self.shell_integration.as_ref()?;
+        terminal_settings(&self.config_dir)
+            .shell_integration
+            .then_some(integration)
+    }
+
+    fn terminal_configure(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::TerminalConfigureParams = decode(params)?;
+        if terminal_settings(&self.config_dir) != p {
+            let bytes = serde_json::to_vec_pretty(&p)
+                .map_err(|error| ControlError::internal(error.to_string()))?;
+            crate::shell_integration::write_private(
+                &self.config_dir.join(TERMINAL_SETTINGS_FILE),
+                &bytes,
+            )
+            .map_err(io_control_error)?;
+        }
+        Ok(json!({}))
     }
 
     /// Serves the `dirijor` MCP tools over loopback Streamable HTTP so Agents
@@ -764,12 +818,16 @@ impl ControlServer {
                         | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::ACCOUNT_SWITCH_ALL
+                        | Method::ACCOUNT_OVERVIEW
+                        | Method::ACCOUNT_ADOPT
+                        | Method::ACCOUNT_ADD
                         | Method::ACCOUNT_CODEX_LOGIN
                         | Method::ACCOUNT_CLAUDE_LOGIN
                         | Method::HOST_INITIALIZE
                         | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
+                        | Method::SESSION_READ_IMAGE
                         | Method::WORKTREE_INTEGRATE
                         | Method::TASK_ANSWER
                         | Method::TASK_CANCEL
@@ -980,6 +1038,8 @@ impl ControlServer {
                 | Method::ACCOUNT_CODEX_CAPTURE
                 | Method::ACCOUNT_CLAUDE_LOGIN
                 | Method::ACCOUNT_CLAUDE_CAPTURE
+                | Method::ACCOUNT_ADOPT
+                | Method::ACCOUNT_ADD
         ) {
             Some(self.account_operations.try_write().map_err(|_| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
         } else {
@@ -1013,6 +1073,9 @@ impl ControlServer {
             Method::ACCOUNT_CODEX_CAPTURE => self.codex_account_capture(params),
             Method::ACCOUNT_CLAUDE_LOGIN => self.claude_account_login(params),
             Method::ACCOUNT_CLAUDE_CAPTURE => self.claude_account_capture(params),
+            Method::ACCOUNT_OVERVIEW => self.account_overview(params),
+            Method::ACCOUNT_ADOPT => self.account_adopt(params),
+            Method::ACCOUNT_ADD => self.account_add(params),
             Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
             Method::ACCOUNT_PROFILES_LIST => {
                 encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
@@ -1022,7 +1085,20 @@ impl ControlServer {
                 if let Some(host) = &profile.host {
                     self.resolve_host(host)?;
                 }
-                encode(&self.accounts.lock().map_err(poisoned)?.upsert(profile)?)
+                let accounts = self.accounts.lock().map_err(poisoned)?;
+                let renamed = accounts
+                    .catalog()?
+                    .profiles
+                    .iter()
+                    .any(|p| p.id == profile.id && p.label != profile.label);
+                // Under the catalog lock, so naming a new profile after its
+                // email never lands after this rename.
+                if renamed {
+                    self.keep_chosen_name(&profile);
+                }
+                let catalog = accounts.upsert(profile)?;
+                drop(accounts);
+                encode(&catalog)
             }
             Method::ACCOUNT_PROFILES_REMOVE => {
                 let params: diri_proto::AgentAccountId = decode(params)?;
@@ -1099,6 +1175,7 @@ impl ControlServer {
             Method::AGENT_CONFIGURE => self.agent_configure(params),
             Method::PROJECT_ADD => self.project_add(params),
             Method::SESSION_READ_DIFF => self.session_read_diff(params),
+            Method::SESSION_READ_IMAGE => self.session_read_image(params),
             Method::SESSION_READ_TRANSCRIPT => self.session_read_transcript(params),
             Method::WORKTREE_INTEGRATE => self.worktree_integrate(params),
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
@@ -1108,6 +1185,7 @@ impl ControlServer {
             Method::DAEMON_SHUTDOWN => self.daemon_shutdown(),
             Method::TELEMETRY_UPLOAD_NOW => telemetry_upload_now(),
             Method::GOVERNOR_CONFIGURE => self.governor_configure(params),
+            Method::TERMINAL_CONFIGURE => self.terminal_configure(params),
             Method::CLIENT_SET_ACTIVE => self.client_set_active(params),
             other => Err(ControlError::not_found(format!(
                 "method {other:?} is not implemented by this engine yet"
@@ -1165,6 +1243,37 @@ impl ControlServer {
         scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
     ) -> Result<JsonValue, ControlError> {
         let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
+        // Decoded before the spawn so a malformed hint never starts a process.
+        let placement = spawn_pane_placement(&raw)?;
+        let parent = raw
+            .get("parent")
+            .and_then(JsonValue::as_str)
+            .map(diri_proto::SessionId::new);
+        let result = self.session_spawn_unplaced(Some(raw), reserved_id, scheduled)?;
+        if let Some(placement) = placement
+            && let Some(id) = result.get("id").and_then(JsonValue::as_str)
+            && let Some(snapshot) = self.workspaces.place_spawned(
+                &diri_proto::SessionId::new(id),
+                parent.as_ref(),
+                &placement,
+            )
+        {
+            self.events.publish(
+                diri_proto::EventName::WORKSPACE_UPDATED,
+                json!({"revision": snapshot.revision}),
+                None,
+            );
+        }
+        Ok(result)
+    }
+
+    fn session_spawn_unplaced(
+        &self,
+        params: Option<JsonValue>,
+        reserved_id: Option<String>,
+        scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
+    ) -> Result<JsonValue, ControlError> {
+        let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
         // Validate before any account, worktree, or remote side effect. Missing
         // argv keeps manifest launch behavior; an explicit malformed argv must
         // never silently drop arguments or fall back to a login shell.
@@ -1196,6 +1305,11 @@ impl ControlServer {
         }
 
         let kind = p.kind.id().to_string();
+        // A plain terminal: the user's login shell, which may get Diri's
+        // shell integration below.
+        let login_terminal = argv.is_empty()
+            && kind == diri_proto::AgentKind::SHELL_ID
+            && p.kind.command().is_none_or(str::is_empty);
         // A generic kind carries the user's command line inside itself.
         let argv = if argv.is_empty() {
             match p.kind.command() {
@@ -1253,6 +1367,7 @@ impl ControlServer {
         let mut mcp_http_token = None;
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
+            launch_args.extend(self.configured_launch_args(None, &kind)?);
             if let Some(injection) = &self.injection {
                 let injected = crate::inject::injection_args_full(
                     &descriptor.injection,
@@ -1306,13 +1421,43 @@ impl ControlServer {
             // No binary in the manifest: the caller has to say what to run.
             None if !argv.is_empty() => {
                 let mut spec = crate::pty::PtySpec::new(argv.clone(), launch_path);
-                spec.env = inherited;
+                // A terminal is scrubbed by its manifest too: an Engine
+                // started from inside a Claude session must not hand its
+                // child-session marker to a `claude` typed in this shell,
+                // which would then save no transcript.
+                spec.env = inherited
+                    .into_iter()
+                    .filter(|(key, _)| !descriptor.should_scrub(key))
+                    .collect();
                 // GUI apps launched by launchd commonly inherit no terminal
                 // environment. A binary-free descriptor is still attached to
                 // Diri's colour-capable PTY, so assert the same capabilities
                 // as manifest-backed Agents instead of leaving tools such as
                 // `clear` unable to operate.
                 crate::agent::assert_color_environment(&mut spec.env);
+                // Every pane can name itself to `dirijor`, as manifest-backed
+                // ones do below; no hooks or MCP config apply to a bare argv.
+                if let Some(injection) = &self.injection {
+                    spec.env.retain(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            crate::inject::SESSION_ID_ENV
+                                | crate::inject::SOCKET_ENV
+                                | crate::inject::CLI_ENV
+                        )
+                    });
+                    spec.env.extend([
+                        (crate::inject::SESSION_ID_ENV.into(), id.clone()),
+                        (
+                            crate::inject::SOCKET_ENV.into(),
+                            self.socket_path.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            crate::inject::CLI_ENV.into(),
+                            injection.cli_path.to_string_lossy().into_owned(),
+                        ),
+                    ]);
+                }
                 spec
             }
             None => {
@@ -1321,6 +1466,9 @@ impl ControlServer {
                 )));
             }
         };
+        if login_terminal && let Some(integration) = self.terminal_shell_integration() {
+            integration.apply(&mut pty);
+        }
 
         if let Some(profile) = &mut account_profile {
             crate::accounts::bind_pty(profile, &mut pty)?;
@@ -1769,7 +1917,7 @@ impl ControlServer {
                 p.worktree_base.as_deref(),
             )
             .map_err(io_control_error)?;
-            requested_cwd.clone_from(&info.path);
+            requested_cwd.clone_from(&info.info.path);
             Some(info)
         } else {
             None
@@ -1824,6 +1972,7 @@ impl ControlServer {
         let mut launch_args = caller_argv.clone();
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
+            launch_args.extend(self.configured_launch_args(Some(&host.id), &kind)?);
             let minted = descriptor
                 .mints_conversation_id()
                 .then(crate::inject::uuid_v4);
@@ -1913,11 +2062,16 @@ impl ControlServer {
         record.kind = p.kind.clone();
         record.originating_prompt = p.initial_prompt.clone();
         record.host = Some(host.id.clone());
-        record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
+        // As on the local spawn path, a linked worktree is an execution cwd
+        // inside the checkout it came from, not a first-level project.
+        let project_root = worktree
+            .as_ref()
+            .map_or_else(|| captured.cwd.clone(), |created| created.repo_root.clone());
+        record.project_id = crate::registry::session_project_id(&project_root, Some(&host.id));
         record.remote_persistence = Some(persistence);
-        if let Some(info) = worktree {
-            record.worktree_path = Some(info.path);
-            record.git_branch = info.branch;
+        if let Some(created) = worktree {
+            record.worktree_path = Some(created.info.path);
+            record.git_branch = created.info.branch;
         }
         record.parent = p.parent.clone();
         record.agent_session_id = agent_session_id;
@@ -1952,7 +2106,7 @@ impl ControlServer {
                 registry.other_live_agent(&id),
             );
         }
-        self.ensure_published_project(&mut registry, &captured.cwd, Some(&host.id));
+        self.ensure_published_project(&mut registry, &project_root, Some(&host.id));
         if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
         } else {
@@ -2809,6 +2963,60 @@ impl ControlServer {
         })
     }
 
+    /// One chunk of an inline image. The bytes are shared with the store,
+    /// so the Registry is held only long enough to find them. A remote
+    /// session's chunk is read from its Holder after the Registry is
+    /// released.
+    fn session_read_image(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReadImageParams = decode(params)?;
+        let not_found = || ControlError::new("image_not_found", "No such image");
+        let source = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let session = registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            match session.remote_inline_images() {
+                Some(client) => Err(client),
+                None => Ok(session.inline_image(&p.key)),
+            }
+        };
+        let image = match source {
+            Ok(image) => image.ok_or_else(not_found)?,
+            Err(client) => {
+                if !diri_proto::inline_image::valid_key(&p.key) {
+                    return Err(not_found());
+                }
+                let chunk = client
+                    .read_image(&p.key, p.offset)
+                    .map_err(|error| {
+                        ControlError::new("remote_image_unavailable", error.to_string())
+                    })?
+                    .ok_or_else(not_found)?;
+                return encode(&diri_proto::SessionReadImageResult {
+                    format: chunk.format,
+                    compressed: chunk.compressed,
+                    width: chunk.width,
+                    height: chunk.height,
+                    total: chunk.total,
+                    offset: chunk.offset,
+                    data: chunk.data,
+                });
+            }
+        };
+        let total = image.data.len() as u64;
+        let start = p.offset.min(total) as usize;
+        let end = (start + diri_proto::inline_image::READ_IMAGE_CHUNK_BYTES).min(image.data.len());
+        encode(&diri_proto::SessionReadImageResult {
+            format: image.format,
+            compressed: image.compressed,
+            width: image.width,
+            height: image.height,
+            total,
+            offset: start as u64,
+            data: image.data[start..end].to_vec(),
+        })
+    }
+
     fn session_reset_terminal(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let registry = self.registry.lock().map_err(poisoned)?;
@@ -3031,12 +3239,21 @@ impl ControlServer {
         // Closing a note's tab never touches its file: the note stays in
         // Search notes (as a closed note) and opening it there brings its tab
         // back, the way closed chats stay in conversation search.
+        drop(registry);
         self.events.record_removed(&removed);
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,
             json!({ "id": p.session_id.0, "reason": "released" }),
             Some(&p.session_id.0),
         );
+        // Closing a pane collapses its split; the tab stays one sidebar row.
+        if let Some(snapshot) = self.workspaces.prune_session(&p.session_id) {
+            self.events.publish(
+                diri_proto::EventName::WORKSPACE_UPDATED,
+                json!({"revision": snapshot.revision}),
+                None,
+            );
+        }
         Ok(json!({}))
     }
 
@@ -3611,6 +3828,7 @@ impl ControlServer {
             ));
         }
         let mut launch_args = descriptor.spawn_args.clone();
+        launch_args.extend(self.configured_launch_args(Some(&host.id), kind.id())?);
         let provider_dir = captured
             .environment
             .iter()
@@ -3718,6 +3936,9 @@ impl ControlServer {
         let mut pty = crate::pty::PtySpec::new(login_shell_argv(), launch_path);
         pty.env = std::env::vars().collect();
         crate::agent::assert_color_environment(&mut pty.env);
+        if let Some(integration) = self.terminal_shell_integration() {
+            integration.apply(&mut pty);
+        }
         Ok(crate::session::SessionSpec {
             id: record.id.0.clone(),
             pty,
@@ -3923,6 +4144,7 @@ impl ControlServer {
         let binary = descriptor.binary.clone().expect("checked above");
         descriptor.binary = Some(self.resolve_local_agent_executable(kind, &binary)?);
         let mut launch_args = descriptor.spawn_args.clone();
+        launch_args.extend(self.configured_launch_args(None, kind)?);
         let mut mcp_http_token = None;
         if let Some(injection) = &self.injection {
             let injected = crate::inject::injection_args_full(
@@ -4061,6 +4283,21 @@ impl ControlServer {
         encode(&self.agent_catalog(&p, false)?)
     }
 
+    /// The user's extra arguments for `kind` on `host`, appended after the
+    /// manifest's own `spawnArgs` on every spawn and resume.
+    fn configured_launch_args(
+        &self,
+        host: Option<&str>,
+        kind: &str,
+    ) -> Result<Vec<String>, ControlError> {
+        Ok(self
+            .agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .preference(host, kind)
+            .launch_args)
+    }
+
     fn resolve_local_agent_executable(
         &self,
         kind: &str,
@@ -4154,15 +4391,21 @@ impl ControlServer {
         if let Some(host) = p.host.as_deref() {
             self.resolve_host(host)?;
         }
-        let preference = crate::agent_catalog::AgentPreference {
-            executable_path: p.executable_path,
-            show_in_quick_create: Some(p.show_in_quick_create),
-        };
-        self.agent_catalog
-            .lock()
-            .map_err(poisoned)?
-            .configure(p.host.as_deref(), &kind, preference)
-            .map_err(io_control_error)?;
+        {
+            let mut catalog = self.agent_catalog.lock().map_err(poisoned)?;
+            let launch_args = match p.launch_args {
+                Some(args) => args,
+                None => catalog.preference(p.host.as_deref(), &kind).launch_args,
+            };
+            let preference = crate::agent_catalog::AgentPreference {
+                executable_path: p.executable_path,
+                show_in_quick_create: Some(p.show_in_quick_create),
+                launch_args,
+            };
+            catalog
+                .configure(p.host.as_deref(), &kind, preference)
+                .map_err(io_control_error)?;
+        }
         let result = self.agent_catalog(
             &diri_proto::AgentReadinessParams {
                 host: p.host,
@@ -4349,6 +4592,7 @@ impl ControlServer {
                 configured_path: preference.executable_path,
                 path_source,
                 show_in_quick_create: show,
+                launch_args: preference.launch_args,
                 error: resolution.configured_error,
                 descriptor,
             });
@@ -4754,6 +4998,52 @@ fn claude_resume_target_in(
     }
 }
 
+/// The optional placement hint of `session.spawn`. Absent, a pane shell (a
+/// shell with a parent) docks below its parent; anything else is not placed.
+fn spawn_pane_placement(
+    params: &JsonValue,
+) -> Result<Option<diri_proto::workspace::SpawnPane>, ControlError> {
+    use diri_proto::workspace::{SPAWN_PANE_FIELD, SpawnPane};
+    if let Some(value) = params.get(SPAWN_PANE_FIELD) {
+        return serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| ControlError::bad_request("pane is not a valid placement"));
+    }
+    let shell = params
+        .get("kind")
+        .and_then(|kind| serde_json::from_value::<diri_proto::AgentKind>(kind.clone()).ok())
+        .is_some_and(|kind| kind == diri_proto::AgentKind::SHELL);
+    let parented = params.get("parent").is_some_and(JsonValue::is_string);
+    Ok((shell && parented).then_some(SpawnPane::BelowParent))
+}
+
+/// Running pane shells with their parents, newest first: what the one-time
+/// layout adoption moves into the parents' tabs.
+fn live_pane_shells(
+    records: &[diri_proto::SessionRecord],
+) -> Vec<(diri_proto::SessionId, diri_proto::SessionId)> {
+    let mut shells: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.kind == diri_proto::AgentKind::SHELL
+                && !record.is_archived()
+                && !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+        })
+        .filter_map(|record| {
+            Some((
+                record.created_at.0,
+                record.id.clone(),
+                record.parent.clone()?,
+            ))
+        })
+        .collect();
+    shells.sort_by(|left, right| right.0.total_cmp(&left.0));
+    shells
+        .into_iter()
+        .map(|(_, id, parent)| (id, parent))
+        .collect()
+}
+
 fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
     let Some(value) = params.get("argv") else {
         return Ok(Vec::new());
@@ -4951,7 +5241,7 @@ struct BackgroundRequest(Arc<AtomicUsize>);
 impl BackgroundRequest {
     fn acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < 32).then_some(active + 1)
             })
             .ok()?;
@@ -6129,14 +6419,7 @@ fn prepare_cursor_input(
                 .map_err(|_| InitialPromptFailure::InputFailed)?;
                 accepted = true;
             }
-        } else if crate::detect::bottom_non_empty(&lines, 8)
-            .iter()
-            .any(|line| {
-                let line = line.trim();
-                line.starts_with("→ Plan, search, build anything")
-                    || line.starts_with("→ Add a follow-up")
-            })
-        {
+        } else if cursor_composer_ready(&lines) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -6144,11 +6427,28 @@ fn prepare_cursor_input(
     Err(InitialPromptFailure::SubmissionUnconfirmed)
 }
 
+fn cursor_composer_ready(lines: &[String]) -> bool {
+    !is_cursor_workspace_trust_screen(lines)
+        && crate::detect::bottom_non_empty(lines, 8)
+            .iter()
+            .any(|line| {
+                let line = line.trim();
+                line.starts_with("→ Plan, search, build anything")
+                    || line.starts_with("→ Add a follow-up")
+            })
+}
+
+/// The selector is live only while an option carries the `▶` marker. Once
+/// answered, cursor-agent 2026.10.01-14929f9 repaints the box without it and
+/// with `Trusting workspace...`, then leaves that box above the composer as
+/// stale paint. The footer is not required: a composer painted under the
+/// dialog can push it out of view.
 fn is_cursor_workspace_trust_screen(lines: &[String]) -> bool {
-    let bottom = crate::detect::bottom_non_empty(lines, 8).join("\n");
-    bottom.contains("[a] Trust this workspace")
-        && bottom.contains("[q] Quit")
-        && bottom.contains("Use arrow keys to navigate, Enter to select, or press the key shown")
+    let has = |needle: &str| lines.iter().any(|line| line.contains(needle));
+    has("[a] Trust this workspace")
+        && has("[q] Quit")
+        && (has("▶ [a] Trust this workspace") || has("▶ [q] Quit"))
+        && !has("Trusting workspace")
 }
 
 /// Types and submits an initial prompt at most once. Screen observations can
@@ -6715,6 +7015,54 @@ mod tests {
                 "bad_request"
             );
         }
+    }
+
+    #[test]
+    fn terminal_configure_switches_shell_integration_and_survives_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let start = || {
+            let registry = Registry::new(engine(), temp.path().join("state.json"));
+            ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"))
+                .with_injection(InjectionConfig {
+                    inject_dir: temp.path().join("inject"),
+                    cli_path: temp.path().join("dirijor"),
+                })
+        };
+        let server = start();
+        let integration = server
+            .terminal_shell_integration()
+            .expect("on by default once installed");
+        let mut spec = crate::pty::PtySpec::new(vec!["/bin/zsh".into(), "-l".into()], "/tmp");
+        integration.apply(&mut spec);
+        assert!(spec.env.iter().any(|(key, _)| key == "ZDOTDIR"));
+
+        server
+            .dispatch(
+                Method::TERMINAL_CONFIGURE,
+                Some(json!({ "shellIntegration": false })),
+            )
+            .unwrap();
+        assert!(server.terminal_shell_integration().is_none());
+        let settings = temp.path().join(TERMINAL_SETTINGS_FILE);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&settings).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Terminals the next Engine restarts before the app connects.
+        assert!(start().terminal_shell_integration().is_none());
+
+        server
+            .dispatch(
+                Method::TERMINAL_CONFIGURE,
+                Some(json!({ "shellIntegration": true })),
+            )
+            .unwrap();
+        assert!(start().terminal_shell_integration().is_some());
+        // Without injection (tests, a bare Engine) nothing is installed.
+        let registry = Registry::new(engine(), temp.path().join("state.json"));
+        let bare = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        assert!(bare.terminal_shell_integration().is_none());
     }
 
     #[test]
@@ -7737,6 +8085,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: vec!["--dangerously-skip-permissions".into()],
                 },
             )
             .expect("bind fake claude executable");
@@ -7752,6 +8101,10 @@ mod tests {
             command.contains(&format!("{}'", executable.display()))
                 && command.contains("'--resume' 'uuid-1'"),
             "resume flags must reach the agent: {command:?}"
+        );
+        assert!(
+            command.contains("'--dangerously-skip-permissions' '--resume' 'uuid-1'"),
+            "configured launch arguments precede the resume grammar: {command:?}"
         );
 
         let fork = server
@@ -7769,6 +8122,45 @@ mod tests {
             command.contains("'--resume' 'uuid-1' '--fork-session'"),
             "fork grammar must reach the agent: {command:?}"
         );
+        assert!(
+            command.contains("'--dangerously-skip-permissions'"),
+            "forks keep the configured launch arguments: {command:?}"
+        );
+    }
+
+    #[test]
+    fn configuring_an_agent_without_launch_args_keeps_them() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let configure = |args: serde_json::Value| {
+            let mut params = json!({
+                "kind": "claude-code",
+                "executablePath": "/usr/bin/true",
+                "showInQuickCreate": true,
+            });
+            if !args.is_null() {
+                params["launchArgs"] = args;
+            }
+            let result: diri_proto::AgentConfigureResult =
+                serde_json::from_value(server.agent_configure(Some(params)).expect("configure"))
+                    .expect("result");
+            result
+                .agents
+                .into_iter()
+                .find(|item| item.kind.id() == "claude-code")
+                .expect("claude row")
+                .launch_args
+        };
+        assert_eq!(
+            configure(json!(["--dangerously-skip-permissions"])),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            configure(serde_json::Value::Null),
+            ["--dangerously-skip-permissions"],
+            "a client that only edits the path must not clear the arguments"
+        );
+        assert!(configure(json!([])).is_empty(), "an empty list clears them");
     }
 
     #[test]
@@ -7793,6 +8185,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .unwrap();
@@ -7909,6 +8302,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(configured.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .expect("bind fake claude executable");
@@ -8753,6 +9147,8 @@ mod tests {
                             content_seq: 1,
                             prompt_excerpt: None,
                             options: None,
+                            stale_after_submit: false,
+                            turn_started: false,
                         },
                     ));
             }
@@ -9708,14 +10104,35 @@ mod tests {
     #[test]
     fn cursor_trust_requires_the_live_selector() {
         let lines = |screen: &str| screen.lines().map(str::to_owned).collect::<Vec<_>>();
-        assert!(is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/trust.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
+        let waiting = lines(include_str!("../tests/fixtures/cursor_screens/trust.txt"));
+        assert!(is_cursor_workspace_trust_screen(&waiting));
+        assert!(!cursor_composer_ready(&waiting));
+        // A build that paints the composer under the dialog and no footer.
+        let footerless = include_str!("../tests/fixtures/cursor_screens/trust.txt").replace(
+            "Use arrow keys to navigate, Enter to select, or press the key shown",
+            "",
+        ) + "  Cursor Agent\n  → Plan, search, build anything\n  Diri Fake\n";
+        let footerless = lines(&footerless);
+        assert!(is_cursor_workspace_trust_screen(&footerless));
+        assert!(
+            !cursor_composer_ready(&footerless),
+            "the composer under the dialog is not the input target"
+        );
+        // After `a` the box stays as stale paint above a composer that works.
+        let answered = lines(include_str!("../tests/fixtures/cursor_screens/trusted.txt"));
+        assert!(!is_cursor_workspace_trust_screen(&answered));
+        assert!(cursor_composer_ready(&answered));
+        for other in [
+            include_str!("../tests/fixtures/cursor_screens/idle.txt"),
+            include_str!("../tests/fixtures/cursor_screens/login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/browser-login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/working.txt"),
+        ] {
+            let screen = lines(other);
+            assert!(!is_cursor_workspace_trust_screen(&screen), "{other}");
+        }
+        assert!(cursor_composer_ready(&lines(include_str!(
             "../tests/fixtures/cursor_screens/idle.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/login.txt"
         ))));
     }
 
@@ -9965,5 +10382,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("subscription worker did not observe Drop cancellation");
+    }
+}
+
+#[cfg(test)]
+mod pane_placement_tests {
+    use super::*;
+    use diri_proto::workspace::{DockEdge, SpawnPane};
+
+    #[test]
+    fn a_parented_shell_docks_below_its_parent_unless_told_otherwise() {
+        let shell = serde_json::to_value(diri_proto::AgentKind::SHELL).unwrap();
+        let claude = serde_json::to_value(diri_proto::AgentKind::CLAUDE_CODE).unwrap();
+        let placement = |params: JsonValue| spawn_pane_placement(&params).unwrap();
+        // An Agent's MCP `shell` child, and a ⌘J from an older client.
+        assert_eq!(
+            placement(json!({"kind": shell, "cwd": "/w", "parent": "s_1"})),
+            Some(SpawnPane::BelowParent)
+        );
+        // A top-level shell, or a child Agent, is not a pane.
+        assert_eq!(placement(json!({"kind": shell, "cwd": "/w"})), None);
+        assert_eq!(
+            placement(json!({"kind": claude, "cwd": "/w", "parent": "s_1"})),
+            None
+        );
+        // Explicit placements win, including "not a pane".
+        assert_eq!(
+            placement(
+                json!({"kind": shell, "cwd": "/w", "parent": "s_1", "pane": {"type": "detached"}})
+            ),
+            Some(SpawnPane::Detached)
+        );
+        assert_eq!(
+            placement(json!({"kind": shell, "cwd": "/w", "pane": {
+                "type": "beside", "tabId": "t", "target": "p", "edge": "right"
+            }})),
+            Some(SpawnPane::Beside {
+                tab_id: diri_proto::workspace::TabId::new("t"),
+                target: diri_proto::workspace::PaneId::new("p"),
+                edge: DockEdge::Right,
+            })
+        );
+        // A malformed hint is refused before anything spawns.
+        assert!(
+            spawn_pane_placement(&json!({"kind": shell, "pane": {"type": "sideways"}})).is_err()
+        );
     }
 }

@@ -412,6 +412,9 @@ struct Shared {
     prompt_input: Mutex<PromptInputState>,
     log: Mutex<OutputLog>,
     screen: Mutex<HeadlessScreen>,
+    /// Device pixels per cell this session's terminal sizes images with, so
+    /// the PTY can report its text area in pixels; `None` for remote.
+    cell_pixels: Option<(u16, u16)>,
     /// The newest size the PTY was given whose emulator reflow has not run
     /// yet. See [`MirrorResize`].
     requested_size: Mutex<Option<(u16, u16)>>,
@@ -448,6 +451,10 @@ struct Shared {
     /// line question is only read off the screen once it has caught up
     /// with what the Holder had written when it answered.
     held_screen_offset: AtomicU64,
+    /// Set while the held pump is waiting out the redraw of a repaint whose
+    /// erase is already in `screen`. The pump publishes when it ends; anyone
+    /// else waking clients meanwhile would show them the erased screen.
+    awaiting_redraw: AtomicBool,
     grid_wake: GridWake,
     /// The manifest this session runs, for telemetry.
     agent: String,
@@ -493,6 +500,8 @@ struct ForegroundProgram {
     group_seen_at: Option<Instant>,
     /// The job's program name, read once per group.
     name: Option<String>,
+    /// The Agent that name was recognised as, decided with it.
+    agent: Option<ForegroundAgent>,
     cwd: Option<String>,
     cwd_read_at: Option<Instant>,
     /// The TCP ports the job listens on: a dev server's address.
@@ -500,6 +509,42 @@ struct ForegroundProgram {
     ports_read_at: Option<Instant>,
     /// The Agent manifest the screen is read with while the reducer is lent.
     read_as: Option<String>,
+}
+
+/// An Agent recognised in a shell's foreground.
+#[derive(Clone, Copy)]
+enum ForegroundAgent {
+    /// One with a launch manifest, by its index in `known_agents`.
+    Manifest(usize),
+    /// One the recognition catalog names, whose status follows its output.
+    Activity(&'static str),
+}
+
+/// How a shell's status is read while an Agent holds its foreground.
+enum Lend<'a> {
+    Screen(&'a KnownAgent),
+    Activity(&'static str),
+}
+
+/// What the program `name` leading group `group` is, if an Agent: a
+/// manifest's own binary first, then the recognition catalog, whose entries
+/// that share a manifest's id are read with that manifest. The npm package is
+/// read only for a short name that needs one.
+fn recognize_agent(known: &[KnownAgent], name: &str, group: i32) -> Option<ForegroundAgent> {
+    if let Some(index) = known.iter().position(|agent| agent.binary == name) {
+        return Some(ForegroundAgent::Manifest(index));
+    }
+    let id = crate::recognition::recognize(name, || {
+        diri_pty::foreground::npm_package(group as u32)
+            .ok()
+            .flatten()
+    })?;
+    Some(
+        match known.iter().position(|agent| agent.manifest_id == id) {
+            Some(index) => ForegroundAgent::Manifest(index),
+            None => ForegroundAgent::Activity(id),
+        },
+    )
 }
 
 /// An Agent a shell can recognise in its foreground.
@@ -982,7 +1027,11 @@ impl MirrorResize {
         };
         screen.resize(cols as usize, rows as usize);
         drop(screen);
-        self.shared.grid_wake.notify();
+        // A TUI answers the resize by clearing and redrawing. If the clear is
+        // already parsed, the held pump publishes once the redraw lands.
+        if !self.shared.awaiting_redraw.load(Ordering::SeqCst) {
+            self.shared.grid_wake.notify();
+        }
     }
 }
 
@@ -1928,6 +1977,8 @@ impl Session {
 
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
+        let (cols, rows) = (spec.pty.cols, spec.pty.rows);
+        let _ = pty.resize_with_pixels(cols, rows, launch_pixels(cols, rows));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, true);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
@@ -1989,6 +2040,11 @@ impl Session {
         let client = HolderClient::new(paths.socket());
         let (floor, stat) = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
+        let _ = client.resize_with_pixels(
+            launch.cols,
+            launch.rows,
+            launch_pixels(launch.cols, launch.rows),
+        );
         Self::attach(spec, client, floor, engine, true, stat.as_ref())
     }
 
@@ -2082,6 +2138,13 @@ impl Session {
                         cols = pty.cols,
                         rows = pty.rows,
                     );
+                    // The launch spec carries no pixel size; an older Holder
+                    // manager would not pass one on.
+                    let _ = client.resize_with_pixels(
+                        pty.cols,
+                        pty.rows,
+                        text_area_pixels(&shared, pty.cols, pty.rows),
+                    );
                     if return_to_shell {
                         watch_early_return_to_shell(&shared, &client);
                     }
@@ -2111,7 +2174,12 @@ impl Session {
                     if let Some((cols, rows)) = handoff.late_size {
                         // A size proposed while the exec was in flight: apply
                         // as an ordinary resize now that the PTY exists.
-                        let _ = client.resize(cols.max(2), rows.max(2));
+                        let (cols, rows) = (cols.max(2), rows.max(2));
+                        let _ = client.resize_with_pixels(
+                            cols,
+                            rows,
+                            text_area_pixels(&shared, cols, rows),
+                        );
                         shared
                             .screen
                             .lock()
@@ -2271,12 +2339,11 @@ impl Session {
             .clone();
         let (foreground_program, foreground_agent, terminal_cwd, foreground_ports) = {
             let foreground = self.shared.foreground.lock().expect("foreground");
-            let agent = foreground.name.as_deref().and_then(|name| {
-                self.shared
-                    .known_agents
-                    .iter()
-                    .find(|agent| agent.binary == name)
-                    .map(|agent| agent.manifest_id.clone())
+            let agent = foreground.agent.map(|agent| match agent {
+                ForegroundAgent::Manifest(index) => {
+                    self.shared.known_agents[index].manifest_id.clone()
+                }
+                ForegroundAgent::Activity(id) => id.to_owned(),
             });
             (
                 foreground.name.clone(),
@@ -2608,7 +2675,9 @@ impl Session {
             alt_screen: modes.0,
             mouse: modes.2,
         };
-        let grid = if current == *signature {
+        // Mid-erase, the screen is not a frame. The signature stays put, so
+        // the pump's publication when the redraw lands sends it.
+        let grid = if current == *signature || self.shared.awaiting_redraw.load(Ordering::SeqCst) {
             None
         } else {
             *signature = current;
@@ -3174,6 +3243,24 @@ impl Session {
         self.shared.reset_generation.load(Ordering::SeqCst)
     }
 
+    /// An inline image this session's terminal placed, by anchor key.
+    /// `None` for a remote session, an unknown key or an evicted image.
+    pub fn inline_image(&self, key: &str) -> Option<diri_terminal_state::StoredImage> {
+        self.shared.screen.lock().expect("screen").inline_image(key)
+    }
+
+    /// The remote client that serves this session's inline images, when its
+    /// live Holder negotiated `inline-images-v1`. Reads through it wait on
+    /// the network, so callers must not hold the Registry while they do.
+    pub fn remote_inline_images(&self) -> Option<Arc<RemoteSessionClient>> {
+        match &self.transport {
+            Transport::Remote(client) if client.supports_inline_images() => {
+                Some(Arc::clone(client))
+            }
+            _ => None,
+        }
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         if let Some(reflow) = self.resize_pty(cols, rows)? {
             reflow.apply();
@@ -3195,9 +3282,15 @@ impl Session {
         {
             return Ok(None);
         }
+        let pixels = text_area_pixels(&self.shared, cols, rows);
         match &self.transport {
-            Transport::Direct(pty) => pty.lock().expect("pty").resize(cols, rows)?,
-            Transport::Held(client) => client.resize(cols, rows).map_err(holder_io_error)?,
+            Transport::Direct(pty) => pty
+                .lock()
+                .expect("pty")
+                .resize_with_pixels(cols, rows, pixels)?,
+            Transport::Held(client) => client
+                .resize_with_pixels(cols, rows, pixels)
+                .map_err(holder_io_error)?,
             Transport::Remote(client) => client.resize(cols, rows)?,
         }
         // Recorded in PTY order: callers resize the PTY under the Registry
@@ -3335,6 +3428,23 @@ impl Drop for Session {
     }
 }
 
+/// The PTY's text area in pixels (`ws_xpixel`/`ws_ypixel`): what image tools
+/// such as `kitten icat` size their output from. Zero where unknown.
+fn text_area_pixels(shared: &Shared, cols: u16, rows: u16) -> (u16, u16) {
+    shared
+        .cell_pixels
+        .map_or((0, 0), |cell| scale_cells(cell, cols, rows))
+}
+
+/// [`text_area_pixels`] for a local PTY spawned before its session state.
+fn launch_pixels(cols: u16, rows: u16) -> (u16, u16) {
+    scale_cells(diri_terminal_state::DEFAULT_CELL_PIXELS, cols, rows)
+}
+
+fn scale_cells((width, height): (u16, u16), cols: u16, rows: u16) -> (u16, u16) {
+    (cols.saturating_mul(width), rows.saturating_mul(height))
+}
+
 fn new_shared(
     spec: &SessionSpec,
     log: OutputLog,
@@ -3390,10 +3500,23 @@ fn new_shared(
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
-        screen: Mutex::new(
-            HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
-                .with_notifications(),
-        ),
+        screen: Mutex::new({
+            let screen = HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
+                .with_notifications();
+            // Only a local session's own emulator feeds the client grid; a
+            // remote session's grid, image anchors and pixels come from its
+            // Holder (`inline-images-v1`), so storing images here too would
+            // cost memory for pixels nobody reads.
+            if spec.remote.is_none() {
+                screen.with_inline_images()
+            } else {
+                screen
+            }
+        }),
+        cell_pixels: spec
+            .remote
+            .is_none()
+            .then_some(diri_terminal_state::DEFAULT_CELL_PIXELS),
         requested_size: Mutex::new(None),
         reducer: Mutex::new(reducer),
         exit: Mutex::new(None),
@@ -3409,6 +3532,7 @@ fn new_shared(
         remote_grid: Mutex::new(None),
         remote_output_offset: AtomicU64::new(0),
         held_screen_offset: AtomicU64::new(0),
+        awaiting_redraw: AtomicBool::new(false),
         grid_wake: GridWake::for_agent(&spec.manifest_id),
         agent: spec.manifest_id.clone(),
         launched_at: fresh.then(Instant::now),
@@ -3667,9 +3791,10 @@ fn apply_foreground_sample(
     let outcome = {
         let mut reducer = shared.reducer.lock().expect("reducer");
         let outcome = match agent {
-            Some(agent) => {
+            Some(Lend::Screen(agent)) => {
                 reducer.lend_to_agent(&agent.manifest_id, Some(&agent.manifest_version), now)
             }
+            Some(Lend::Activity(id)) => reducer.lend_to_activity(id, now),
             None if reducer.foreground_agent().is_some() => reducer.return_from_agent(running, now),
             None => reducer.reduce(StatusSignal::ForegroundJob { running }, now),
         };
@@ -3681,7 +3806,9 @@ fn apply_foreground_sample(
 }
 
 /// Names a local shell's foreground job and reads its working directory,
-/// returning the Agent that job is when it is one whose screen can be read.
+/// returning how to read the Agent that job is, when it is one: by its
+/// manifest's screen rules, or by its output when it is known only by name.
+/// A manifest Agent without screen rules is left to the shell's job tracking.
 ///
 /// A job's name is read once per process group. A group seen before its
 /// leader has exec'd still carries the shell's own name; that read is not
@@ -3692,7 +3819,7 @@ fn observe_foreground_program(
     child_pid: i32,
     foreground_pgid: Option<i32>,
     running: bool,
-) -> Option<&KnownAgent> {
+) -> Option<Lend<'_>> {
     let job = foreground_pgid.filter(|_| running);
     let mut changed = false;
     let mut foreground = shared.foreground.lock().expect("foreground");
@@ -3701,6 +3828,7 @@ fn observe_foreground_program(
         foreground.group_seen_at = Some(Instant::now());
         foreground.ports_read_at = None;
         changed |= foreground.name.take().is_some();
+        foreground.agent = None;
         changed |= !std::mem::take(&mut foreground.ports).is_empty();
     }
     // What the job serves, read on the same terms as its name: once it has
@@ -3729,6 +3857,7 @@ fn observe_foreground_program(
         && let Ok(name) = diri_pty::foreground::program_name(group as u32)
         && diri_pty::foreground::program_name(child_pid as u32).ok() != Some(name.clone())
     {
+        foreground.agent = recognize_agent(&shared.known_agents, &name, group);
         foreground.name = Some(name);
         changed = true;
     }
@@ -3744,11 +3873,12 @@ fn observe_foreground_program(
             changed = true;
         }
     }
-    let agent = foreground.name.as_deref().and_then(|name| {
-        shared
-            .known_agents
-            .iter()
-            .find(|agent| agent.binary == name && agent.reads_screen)
+    let agent = foreground.agent.and_then(|agent| match agent {
+        ForegroundAgent::Manifest(index) => {
+            let agent = &shared.known_agents[index];
+            agent.reads_screen.then_some(Lend::Screen(agent))
+        }
+        ForegroundAgent::Activity(id) => Some(Lend::Activity(id)),
     });
     drop(foreground);
     if changed {
@@ -4248,6 +4378,7 @@ fn handle_remote_message(
             {
                 return RemoteConnectionDisposition::Fatal;
             }
+            client.observe_hello_capabilities(&acknowledgement);
             if let RemoteProcessState::Exited { code, signal } = acknowledgement.process_state {
                 record_remote_exit(shared, ProcessExit { code, signal });
                 return RemoteConnectionDisposition::Exited;
@@ -4383,6 +4514,10 @@ fn handle_remote_message(
         }
         RemoteMessage::ScrollbackResponse(response) => {
             client.complete_scrollback(response);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::ImageResponse(response) if client.supports_inline_images() => {
+            client.complete_image(response);
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::Error(error) => {
@@ -4779,6 +4914,8 @@ fn pump(
             Ok(n) => {
                 shared.grid_wake.note_output_for_telemetry();
                 let closed = feed_output_batch(&shared, &mut reader, &mut buffer, n);
+                // The batch is as whole as it will get; it publishes below.
+                shared.awaiting_redraw.store(false, Ordering::SeqCst);
                 // One detection pass per batch, not per read: the reducer
                 // discards observations it has already judged anyway.
                 let (observation, replies) = {
@@ -4974,6 +5111,66 @@ fn reap_direct(
     }
 }
 
+/// Why a held pump is holding a batch back instead of publishing it.
+///
+/// The held counterpart of [`feed_output_batch`]'s settle, with the same
+/// budgets. A TUI that clears on resize (Cursor, any Ink app) writes the clear
+/// at once and the redraw a frame or two later, and the redraw itself can be
+/// the whole conversation, many reads long. Publishing on the first quiet
+/// poll put a blank pane on screen for every resize; publishing on the batch
+/// ceiling, already spent waiting for the redraw, put its first read on
+/// screen scrolled to the wrong place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepaintHold {
+    /// The screen holds less than the last published frame and its redraw
+    /// has not started. Quiet does not end this; only content or the
+    /// deadline does.
+    Erased(Instant),
+    /// Content is back after a full clear, but the rest of the rewrite may
+    /// still be on its way. The first quiet poll publishes it.
+    Redrawing(Instant),
+}
+
+impl RepaintHold {
+    fn until(self) -> Instant {
+        match self {
+            Self::Erased(until) | Self::Redrawing(until) => until,
+        }
+    }
+}
+
+/// What the pending batch is waiting for after taking the screen from
+/// `filled_before` to `filled_after` cells, if anything.
+///
+/// A blank screen gets [`blank_repaint_ceiling`] from when it first went
+/// blank, and so does the rewrite that follows it; a screen that only lost
+/// some content gets [`OUTPUT_REPAINT_CEILING`] from when the batch opened.
+/// A closed synchronized update is a whole frame by its own declaration.
+fn repaint_hold(
+    blank_since: &mut Option<Instant>,
+    batch_started: Instant,
+    filled_before: usize,
+    filled_after: usize,
+    complete: bool,
+    now: Instant,
+) -> Option<RepaintHold> {
+    if complete {
+        *blank_since = None;
+        return None;
+    }
+    if filled_after == 0 && filled_before != 0 {
+        // Anchored to the first blank write, so a run of them cannot extend
+        // the grace.
+        let since = *blank_since.get_or_insert(now);
+        return Some(RepaintHold::Erased(since + blank_repaint_ceiling()));
+    }
+    if let Some(since) = *blank_since {
+        return Some(RepaintHold::Redrawing(since + blank_repaint_ceiling()));
+    }
+    (filled_after < filled_before)
+        .then(|| RepaintHold::Erased(batch_started + OUTPUT_REPAINT_CEILING))
+}
+
 /// Feeds one batch of PTY output: the read the caller already made, plus every
 /// continuation that arrives before the batch settles.
 ///
@@ -5029,6 +5226,9 @@ fn feed_output_batch(
             // it erased: nothing is left to wait for.
             let complete = screen.synchronized_updates_completed() != synchronized
                 && !screen.in_synchronized_update();
+            shared
+                .awaiting_redraw
+                .store(!complete && after < before, Ordering::SeqCst);
             (
                 !complete && after < before,
                 !complete && after == 0 && before != 0,
@@ -5415,6 +5615,12 @@ fn pump_held(
     // Filled cells when the pending batch opened, so an echo is judged
     // against the last published screen rather than the previous read.
     let mut batch_filled: Option<usize> = None;
+    // Set while the pending batch is a repaint caught between its erase and
+    // the end of its redraw; see [`RepaintHold`].
+    let mut repaint: Option<RepaintHold> = None;
+    // When the pending batch blanked the screen, which is when a blank
+    // repaint's grace starts.
+    let mut blank_since: Option<Instant> = None;
     // Until the tail is first caught up, bytes are history, not activity:
     // they must render, but not flip a quiet adopted session to Working.
     let mut replaying = true;
@@ -5522,10 +5728,16 @@ fn pump_held(
                 // draining within the batch deadline, then publish even if
                 // the child produces no more output. Truly idle sessions
                 // retain their existing blocking wait.
-                let timeout = publish_pending.map_or_else(
-                    || shared.quiet_tick(),
-                    |started| OUTPUT_BATCH_CEILING.saturating_sub(started.elapsed()),
-                );
+                let timeout = match (repaint, publish_pending) {
+                    (Some(RepaintHold::Erased(until)), _) => {
+                        until.saturating_duration_since(Instant::now())
+                    }
+                    (Some(RepaintHold::Redrawing(until)), _) => until
+                        .saturating_duration_since(Instant::now())
+                        .min(OUTPUT_BATCH_CEILING),
+                    (None, Some(started)) => OUTPUT_BATCH_CEILING.saturating_sub(started.elapsed()),
+                    (None, None) => shared.quiet_tick(),
+                };
                 match stream.next_run_into(timeout, LOG_READ_BUDGET, &mut live_run) {
                     // Contiguous by construction, and checked anyway: a run
                     // that does not start where the last one ended means
@@ -5573,14 +5785,24 @@ fn pump_held(
             chunk.len() < LOG_READ_BUDGET
         };
 
-        if chunk.is_empty() {
+        // Quiet mid-erase is not the end of a frame: the redraw is still on its
+        // way, so wait for it rather than publish the erased screen.
+        let awaiting_redraw = chunk.is_empty()
+            && matches!(repaint, Some(RepaintHold::Erased(until)) if Instant::now() < until);
+        if chunk.is_empty() && !awaiting_redraw {
             batch_filled = None;
+            repaint = None;
+            blank_since = None;
+            shared.awaiting_redraw.store(false, Ordering::SeqCst);
             if publish_pending.take().is_some() {
                 shared.grid_wake.notify();
             }
+        }
+        if chunk.is_empty() {
             // Output stopped with a screen detection has not judged yet: this
-            // is the settle, and it is what makes throttling safe.
-            if eval_dirty {
+            // is the settle, and it is what makes throttling safe. A screen
+            // still waiting for its redraw is not settled.
+            if eval_dirty && !awaiting_redraw {
                 eval_dirty = false;
                 last_eval_at = Some(Instant::now());
                 let observation = {
@@ -5643,7 +5865,10 @@ fn pump_held(
                 // A subscription already waited a tick for its frame; waiting
                 // again here would add one to every quiet pass.
                 _ if streaming => false,
-                Some(watcher) => watcher.wait(shared.quiet_tick()),
+                Some(watcher) => watcher.wait(match repaint {
+                    Some(hold) => hold.until().saturating_duration_since(Instant::now()),
+                    None => shared.quiet_tick(),
+                }),
                 None => {
                     std::thread::sleep(shared.quiet_tick());
                     false
@@ -5769,6 +5994,16 @@ fn pump_held(
                 screen.feed_with_history(output, historical_bytes);
                 let complete = screen.synchronized_updates_completed() != synchronized
                     && !screen.in_synchronized_update();
+                // Raised before the lock drops, so no publisher reads the
+                // erase in between; see `repaint_hold` for when it lowers.
+                if !replaying
+                    && offset > replay_until
+                    && !complete
+                    && (blank_since.is_some()
+                        || batch_filled.is_some_and(|before| screen.filled_cells() < before))
+                {
+                    shared.awaiting_redraw.store(true, Ordering::SeqCst);
+                }
                 if screen.has_notifications() {
                     shared.bump_state_version();
                 }
@@ -5817,6 +6052,18 @@ fn pump_held(
                 shared.grid_wake.note_output_for_telemetry();
             }
             let batch_started = *publish_pending.get_or_insert_with(Instant::now);
+            if !historical && !replaying {
+                repaint = batch_filled.and_then(|filled_before| {
+                    repaint_hold(
+                        &mut blank_since,
+                        batch_started,
+                        filled_before,
+                        filled_after,
+                        complete,
+                        Instant::now(),
+                    )
+                });
+            }
             // A keystroke's echo cannot wait for the empty poll that proves
             // the burst is over; see [`EchoRequest`].
             let answers_input = !historical
@@ -5827,9 +6074,20 @@ fn pump_held(
                         request.answered_by(now, filled_before, filled_after, cols, complete)
                     })
                 });
-            if caught_up || answers_input || batch_started.elapsed() >= OUTPUT_BATCH_CEILING {
+            shared
+                .awaiting_redraw
+                .store(repaint.is_some(), Ordering::SeqCst);
+            let settled = match repaint {
+                Some(RepaintHold::Erased(until)) => Instant::now() >= until,
+                Some(RepaintHold::Redrawing(until)) => caught_up || Instant::now() >= until,
+                None => caught_up || batch_started.elapsed() >= OUTPUT_BATCH_CEILING,
+            };
+            if settled || answers_input {
                 publish_pending = None;
                 batch_filled = None;
+                repaint = None;
+                blank_since = None;
+                shared.awaiting_redraw.store(false, Ordering::SeqCst);
                 shared.grid_wake.notify();
             }
             let now = SystemTime::now();
@@ -5860,6 +6118,7 @@ fn pump_held(
 
     // A repaint still being assembled when the holder exited is the last thing
     // clients will ever see of this session: publish it.
+    shared.awaiting_redraw.store(false, Ordering::SeqCst);
     if publish_pending.take().is_some() {
         shared.grid_wake.notify();
     }
@@ -7807,6 +8066,68 @@ fi
 }
 
 #[cfg(test)]
+mod repaint_hold_tests {
+    use super::*;
+
+    #[test]
+    fn a_clear_waits_for_its_redraw_and_the_rewrite_publishes_when_quiet() {
+        let opened = Instant::now();
+        let mut blank_since = None;
+        let erased = repaint_hold(&mut blank_since, opened, 600, 0, false, opened);
+        let Some(RepaintHold::Erased(until)) = erased else {
+            panic!("a blank screen must wait for its redraw: {erased:?}");
+        };
+        assert_eq!(until, opened + blank_repaint_ceiling());
+
+        // More blank writes do not stretch the grace.
+        let later = opened + Duration::from_millis(30);
+        assert_eq!(
+            repaint_hold(&mut blank_since, opened, 600, 0, false, later),
+            Some(RepaintHold::Erased(until))
+        );
+
+        // The first read of the rewrite, scrolled past where it ends and
+        // holding more than before or less, is not a frame on its own.
+        for filled in [900, 200] {
+            assert_eq!(
+                repaint_hold(&mut blank_since, opened, 600, filled, false, later),
+                Some(RepaintHold::Redrawing(until))
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_erase_gets_one_frame_and_additive_output_none() {
+        let opened = Instant::now();
+        let mut blank_since = None;
+        assert_eq!(
+            repaint_hold(&mut blank_since, opened, 600, 400, false, opened),
+            Some(RepaintHold::Erased(opened + OUTPUT_REPAINT_CEILING))
+        );
+        assert_eq!(
+            repaint_hold(&mut blank_since, opened, 600, 650, false, opened),
+            None
+        );
+        // An empty screen staying empty is not an erase.
+        assert_eq!(
+            repaint_hold(&mut blank_since, opened, 0, 0, false, opened),
+            None
+        );
+    }
+
+    #[test]
+    fn a_closed_synchronized_update_is_whole_however_much_it_erased() {
+        let opened = Instant::now();
+        let mut blank_since = Some(opened);
+        assert_eq!(
+            repaint_hold(&mut blank_since, opened, 600, 0, true, opened),
+            None
+        );
+        assert_eq!(blank_since, None);
+    }
+}
+
+#[cfg(test)]
 mod echo_request_tests {
     use super::*;
 
@@ -8053,6 +8374,82 @@ mod foreground_program_tests {
         let sub = root.join("sub").to_string_lossy().into_owned();
         wait_until("cd to be followed", || {
             session.view().terminal_cwd.as_deref() == Some(sub.as_str())
+        });
+        let _ = session.terminate(Duration::from_secs(2));
+    }
+
+    /// An Agent with no launch manifest, typed at the prompt, is recognised
+    /// by name from the catalog and its status follows its output.
+    #[test]
+    fn a_shell_recognises_an_agent_known_only_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_goose = bin.join("goose");
+        // Streams a reply for a while after each line, as an Agent does.
+        std::fs::write(
+            &fake_goose,
+            "#!/bin/sh\necho ready\nwhile read -r line; do\n  i=0\n  while [ $i -lt 15 ]; do echo \"working $i\"; sleep 0.1; i=$((i+1)); done\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &fake_goose,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let spec = SessionSpec {
+            id: "foreground-goose".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into(), "-i".into()], &root)
+                .env("PATH", &format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PS1", "$ ")
+                .size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: logs,
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let mut session = Session::spawn(spec, Arc::new(engine)).expect("spawn");
+        let root_text = root.to_string_lossy().into_owned();
+        wait_until("the prompt's directory", || {
+            session.view().terminal_cwd.as_deref() == Some(root_text.as_str())
+        });
+
+        session.write_input(b"goose\r").unwrap();
+        wait_until("the Agent to be recognised", || {
+            let view = session.view();
+            view.foreground_program.as_deref() == Some("goose")
+                && view.foreground_agent.as_deref() == Some("goose")
+        });
+        wait_until("the reducer to be lent and idle", || {
+            session.shared.reducer.lock().unwrap().foreground_agent() == Some("goose")
+                && session.status() == SessionStatus::Idle
+        });
+
+        session.write_input(b"go\r").unwrap();
+        wait_until("its reply to read as work", || {
+            session.status() == SessionStatus::Working
+        });
+        wait_until("its quiet to read as idle", || {
+            session.status() == SessionStatus::Idle
+        });
+
+        session.write_input(b"\x03").unwrap();
+        wait_until("the shell to take its status back", || {
+            let view = session.view();
+            view.foreground_agent.is_none()
+                && session
+                    .shared
+                    .reducer
+                    .lock()
+                    .unwrap()
+                    .foreground_agent()
+                    .is_none()
         });
         let _ = session.terminate(Duration::from_secs(2));
     }
